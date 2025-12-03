@@ -4,6 +4,18 @@ def test_core_modules_import():
     This protects us from refactors that break basic imports.
     """
     import importlib
+    import sys
+    import types
+
+    if "watchdog" not in sys.modules:
+        observer_stub = type("Observer", (), {})
+        event_handler_stub = type("FileSystemEventHandler", (), {})
+        watchdog_stub = types.SimpleNamespace()
+        watchdog_stub.observers = types.SimpleNamespace(Observer=observer_stub)
+        watchdog_stub.events = types.SimpleNamespace(FileSystemEventHandler=event_handler_stub)
+        sys.modules["watchdog"] = watchdog_stub
+        sys.modules["watchdog.observers"] = watchdog_stub.observers
+        sys.modules["watchdog.events"] = watchdog_stub.events
 
     modules = [
         "watcher",
