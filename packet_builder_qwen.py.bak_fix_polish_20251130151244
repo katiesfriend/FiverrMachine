@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+packet_builder_qwen.py
+
+Builds tailored resume + cover letter packets for each job description in a job folder.
+
+Inputs (inside JOB_DIR):
+- base_resume.txt          : base resume text (already extracted from your .docx)
+- job_description_*.txt    : one or more job description files
+- client_request.json      : small JSON with client preferences (optional)
+
+Outputs (inside JOB_DIR):
+- resume_jobXX.txt
+- cover_letter_jobXX.txt
+- score_jobXX.json         : includes ats_score, model info, notes, polishing flags
+
+Heavy lifting is done by Ollama with model qwen2.5:14b.
+Optional polishing is done by OpenAI if OPENAI_API_KEY is set.
+"""
+
+import json
+import os
+import sys
+import glob
+import textwrap
+from typing import Dict, Any, Tuple
+from resume_loader import load_base_resume as _load_base_resume
+
+import requests
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+
+# Ollama config
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.environ.get("FIVERR_QWEN_MODEL", "qwen2.5:14b")
+
+# OpenAI polishing config (optional)
+OPENAI_MODEL = os.environ.get("FIVERR_OPENAI_MODEL", "gpt-4o-mini")
+
+# Safety: we keep temperature modest so outputs are stable
+QWEN_TEMPERATURE = float(os.environ.get("FIVERR_QWEN_TEMPERATURE", "0.4"))
+
+# -----------------------------
+# Helpers: file loading
+# -----------------------------
+
+def load_base_resume(job_dir: str) -> str:
+    """
+    Compatibility wrapper that delegates to resume_loader.load_base_resume.
+    This lets us support many resume formats without changing the rest
+    of the pipeline.
+    """
+    return _load_base_resume(job_dir)
+
+
+def load_client_meta(job_dir: str) -> Dict[str, Any]:
+    path = os.path.join(job_dir, "client_request.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception:
+        # if malformed, just ignore; pipeline should still run
+        return {}
+
+
+def load_job_descriptions(job_dir: str):
+    pattern = os.path.join(job_dir, "job_description_*.txt")
+    files = sorted(glob.glob(pattern))
+    return files
+
+
+# -----------------------------
+# Core: call Qwen via Ollama
+# -----------------------------
+
+def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Call Ollama /api/chat with qwen2.5:14b to generate:
+      - resume
+      - cover_letter
+      - ats_score (0-100)
+      - notes
+
+    We instruct Qwen to answer in **strict JSON**.
+    """
+    system_prompt = textwrap.dedent(
+        """
+        You are an expert resume and cover letter writer that specializes in
+        Applicant Tracking Systems (ATS) optimization and high-conversion job applications.
+
+        TASK:
+        - Read the client's base resume.
+        - Read the target job description.
+        - Read any client preferences / metadata.
+        - Produce a tailored resume and cover letter that match the job description and
+          highlight the client's strengths honestly.
+        - Estimate an ATS compatibility score from 0 to 100.
+        - Provide brief notes explaining why you scored it that way.
+
+        IMPORTANT FORMATTING RULES:
+        - Respond in VALID JSON ONLY.
+        - Top-level JSON object must have EXACTLY these keys:
+            - "resume"        (string, full resume text)
+            - "cover_letter"  (string, full cover letter text)
+            - "ats_score"     (number between 0 and 100)
+            - "notes"         (string, brief explanation)
+        - Do NOT include backticks, markdown, or any extra commentary outside JSON.
+        """
+    ).strip()
+
+    user_prompt = textwrap.dedent(
+        f"""
+        CLIENT METADATA (JSON):
+        {json.dumps(client_meta, indent=2)}
+
+        BASE RESUME:
+        {base_resume}
+
+        JOB DESCRIPTION:
+        {job_desc}
+
+        Please generate the JSON response now.
+        """
+    ).strip()
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": QWEN_TEMPERATURE
+        },
+    }
+
+    url = f"{OLLAMA_URL}/api/chat"
+    resp = requests.post(url, json=payload, timeout=180)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Ollama native format: {"message": {"role": "...", "content": "..."}, ...}
+    content = ""
+    if isinstance(data, dict):
+        msg = data.get("message") or {}
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+    if not content:
+        raise RuntimeError(f"Ollama returned empty message content: {data}")
+
+    content = content.strip()
+
+    # Try to parse Qwen's JSON
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError:
+        # Fallback: wrap raw text as resume, create generic cover letter & score
+        # This keeps pipeline alive even if model drifts from strict JSON.
+        decoded = {
+            "resume": content,
+            "cover_letter": "Unable to parse structured cover letter; raw model output used as resume.",
+            "ats_score": 80,
+            "notes": "Model did not return valid JSON. Used raw content as resume.",
+        }
+
+    # Normalize & validate fields
+    resume = str(decoded.get("resume", "")).strip()
+    cover_letter = str(decoded.get("cover_letter", "")).strip()
+    ats_score = decoded.get("ats_score", 80)
+    try:
+        ats_score = float(ats_score)
+    except (TypeError, ValueError):
+        ats_score = 80.0
+    ats_score = max(0.0, min(100.0, ats_score))
+
+    notes = str(decoded.get("notes", "")).strip()
+
+    return {
+        "resume": resume,
+        "cover_letter": cover_letter,
+        "ats_score": ats_score,
+        "notes": notes,
+    }
+
+
+# -----------------------------
+# Optional: OpenAI polishing
+# -----------------------------
+
+def maybe_polish_with_openai(text: str, kind: str) -> Tuple[str, bool]:
+    """
+    Optionally polish text with OpenAI if OPENAI_API_KEY is set.
+    - kind: "resume" or "cover_letter"
+    - Enforces: no EM dashes, only normal hyphen '-' if needed.
+
+    Returns (polished_text, used_openai_flag).
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return text, False
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception:
+        return text, False
+
+    client = OpenAI(api_key=api_key)
+
+    system_prompt = textwrap.dedent(
+        f"""
+        You are a professional editor for a {kind.replace('_', ' ')}.
+
+        TASK:
+        - Preserve all factual content.
+        - Improve clarity, flow, and professionalism.
+        - Keep it concise and strongly targeted to the job description context.
+        - Do NOT invent facts or add fake achievements.
+        - Do NOT use EM DASH characters (—). Use a normal hyphen '-' instead if needed.
+        - Return ONLY the final edited text, with no explanations.
+        """
+    ).strip()
+
+    try:
+        completion = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.3,
+        )
+def process_job(job_dir: str) -> None:
+    # High-level job banner
+    print("\n====================================================", flush=True)
+    print(f"[BUILDER] Processing job folder: {job_dir}", flush=True)
+    print("====================================================", flush=True)
+
+    # Stage 1: load inputs
+    print("[BUILDER]   [1/3] Loading base_resume...", flush=True)
+    base_resume = load_base_resume(job_dir)
+
+    print("[BUILDER]   [2/3] Loading client_request.json (if present)...", flush=True)
+    client_meta = load_client_meta(job_dir)
+
+    print("[BUILDER]   [3/3] Loading job_description_*.txt files...", flush=True)
+    jd_files = load_job_descriptions(job_dir)
+    print(f"[BUILDER]   -> Found {len(jd_files)} job description files.", flush=True)
+
+    if not jd_files:
+        print("[BUILDER] No job_description_*.txt files found, nothing to do.", flush=True)
+        return
+
+    # Stage 2: per-job generation
+    total = len(jd_files)
+    for idx, jd_path in enumerate(jd_files, start=1):
+        job_label = f"{idx:02d}"
+        print(
+            f"\n[BUILDER] ===== Job {job_label}/{total}: {os.path.basename(jd_path)} =====",
+            flush=True,
+        )
+
+        with open(jd_path, "r", encoding="utf-8", errors="ignore") as f:
+            jd_text = f.read().strip()
+
+        print(f"[BUILDER]   -> Calling Qwen draft for job {job_label}...", flush=True)
+        draft = call_qwen_draft(base_resume, jd_text, client_meta)
+
+        resume_text = draft["resume"]
+        cover_text = draft["cover_letter"]
+        ats_score = draft["ats_score"]
+        notes = draft["notes"]
+
+        # Optional polishing
+        print(f"[BUILDER]   -> Optional OpenAI polish for job {job_label}...", flush=True)
+        resume_text, resume_polished = maybe_polish_with_openai(resume_text, "resume")
+        cover_text, cover_polished = maybe_polish_with_openai(cover_text, "cover_letter")
+
+        # Write outputs
+        print(f"[BUILDER]   -> Writing outputs for job {job_label}...", flush=True)
+        resume_out = os.path.join(job_dir, f"resume_job{job_label}.txt")
+        cover_out = os.path.join(job_dir, f"cover_letter_job{job_label}.txt")
+        score_out = os.path.join(job_dir, f"score_job{job_label}.json")
+
+        with open(resume_out, "w", encoding="utf-8") as f:
+            f.write(resume_text)
+
+        with open(cover_out, "w", encoding="utf-8") as f:
+            f.write(cover_text)
+
+        score_payload = {
+            "ats_score": ats_score,
+            "notes": notes,
+            "model": OLLAMA_MODEL,
+            "ollama_url": OLLAMA_URL,
+            "openai_polish": {
+                "used": resume_polished or cover_polished,
+                "model": OPENAI_MODEL if (resume_polished or cover_polished) else None,
+            },
+        }
+
+        with open(score_out, "w", encoding="utf-8") as f:
+            json.dump(score_payload, f, indent=2)
+
+        print(
+            f"[BUILDER]   -> Done job {job_label}: "
+            f"ATS={ats_score}, OpenAI polish={'yes' if (resume_polished or cover_polished) else 'no'}",
+            flush=True,
+        )
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: packet_builder_qwen.py JOB_DIR", file=sys.stderr)
+        sys.exit(1)
+
+    job_dir = sys.argv[1]
+    process_job(job_dir)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+packet_builder_qwen.py
+
+Core logic for building high-quality job packets:
+
+FLOW:
+  - For a given JOB_xxxxx directory:
+      * Read base_resume.txt
+      * Read all job_description_XX.txt files
+      * Read client_meta.json if present
+  - For each job description:
+      * Use local Qwen model (via HTTP API) to generate draft resume & cover letter
+      * Use OpenAI (gpt-4o/gpt-5.1) to polish, enforce ATS alignment, and score 0–100
+      * Write tailored_resume_XX.txt, cover_letter_XX.txt, and score_XX.json
+  - If score < 92, perform a revision round (Qwen + OpenAI) until >= 92 or max attempts.
+
+NOTES:
+  - Qwen endpoint is assumed to be OpenAI-compatible (as provided by Open WebUI or similar).
+  - You may need to adjust QWEN_API_BASE and QWEN_MODEL to match your setup.
+"""
+
+import json
+import os
+from pathlib import Path
+from typing import Dict, Tuple, List
+
+import requests
+from openai import OpenAI
+
+BASE = Path("/home/mykl/webui/filesystem/FiverrMachine")
+PROCESSING = BASE / "PROCESSING"
+LOGS = BASE / "LOGS"
+
+MIN_SCORE = 92
+MAX_REVISION_ATTEMPTS = 2
+
+# -------------------------------
+# CONFIG: Qwen + OpenAI
+# -------------------------------
+
+# Qwen: assumed to be served via an OpenAI-compatible endpoint (e.g., Open WebUI).
+# Update these to match your actual local Qwen API.
+QWEN_API_BASE = os.getenv("QWEN_API_BASE", "http://127.0.0.1:11434/v1")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen2.5-14b")
+
+# OpenAI for polishing and scoring (uses OPENAI_API_KEY env var)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+
+def log(msg: str) -> None:
+    """Append a message to packet_builder.log and print to stdout."""
+    LOGS.mkdir(parents=True, exist_ok=True)
+    line = f"[BUILDER] {msg}\n"
+    print(line, end="")
+    (LOGS / "packet_builder.log").open("a", encoding="utf-8").write(line)
+
+
+def call_qwen_draft(base_resume: str, job_description: str, client_meta: dict) -> Dict[str, str]:
+    """
+    Call local Qwen to produce a draft resume and cover letter.
+
+    This uses an OpenAI-compatible /v1/chat/completions-style API.
+    Adjust the payload if your local endpoint differs.
+    """
+    url = f"{QWEN_API_BASE}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+
+    system_msg = (
+        "You are a helpful AI assistant specializing in drafting resumes and cover letters. "
+        "You will create a first-pass draft tailored to a job description. "
+        "Do not worry about perfection; this draft will be polished later by another model."
+    )
+
+    user_msg = (
+        "JOB DESCRIPTION:\n"
+        "-----------------\n"
+        f"{job_description}\n\n"
+        "BASE RESUME:\n"
+        "-----------------\n"
+        f"{base_resume}\n\n"
+        "CLIENT META (JSON):\n"
+        "-----------------\n"
+        f"{json.dumps(client_meta, indent=2)}\n\n"
+        "TASK:\n"
+        "Create a draft tailored resume and cover letter as JSON with keys:\n"
+        "  - resume\n"
+        "  - cover_letter\n"
+    )
+
+    payload = {
+        "model": QWEN_MODEL,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.7,
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Extract text from first choice
+    content = data["choices"][0]["message"]["content"]
+    # Try to interpret as JSON, fallback to raw text
+    try:
+        parsed = json.loads(content)
+        resume_draft = parsed.get("resume", "")
+        cover_draft = parsed.get("cover_letter", "")
+    except Exception:
+        # Simple heuristic split
+        resume_draft = content
+        cover_draft = "COVER LETTER DRAFT:\n\n" + content
+
+    return {"resume": resume_draft, "cover_letter": cover_draft}
+
+
+def call_openai_polish_and_score(
+    base_resume: str,
+    job_description: str,
+    draft_resume: str,
+    draft_cover_letter: str,
+    client_meta: dict,
+) -> Dict[str, object]:
+    """
+    Use OpenAI to:
+      - polish the draft resume & cover letter
+      - maximize ATS alignment with the job description
+      - remove em-dashes from cover letter
+      - generate a score from 0–100 and notes explaining the score.
+
+    Returns a dict with:
+      - resume (str)
+      - cover_letter (str)
+      - score (int)
+      - notes (str)
+    """
+    client = OpenAI()
+
+    system_prompt = (
+        "You are an elite resume writer and ATS optimization specialist. "
+        "You receive:\n"
+        "  - a job description\n"
+        "  - the candidate's base resume\n"
+        "  - a draft tailored resume and cover letter created by another model\n"
+        "Your tasks:\n"
+        "  1) Correct and polish the draft resume for clarity, concision, and ATS alignment.\n"
+        "  2) Correct and polish the draft cover letter so it is persuasive and professional.\n"
+        "  3) Ensure the cover letter uses NO em-dashes ('—'); use hyphens '-' instead.\n"
+        "  4) Score the final resume+cover letter on a 0–100 scale for how well they match the job.\n"
+        "  5) Briefly explain the score.\n\n"
+        "Output STRICT JSON with keys:\n"
+        "  - resume: string\n"
+        "  - cover_letter: string\n"
+        "  - score: integer (0–100)\n"
+        "  - notes: string\n"
+        "Do not include any text before or after the JSON."
+    )
+
+    user_prompt = (
+        "JOB DESCRIPTION:\n"
+        "-----------------\n"
+        f"{job_description}\n\n"
+        "BASE RESUME:\n"
+        "-----------------\n"
+        f"{base_resume}\n\n"
+        "DRAFT RESUME:\n"
+        "-----------------\n"
+        f"{draft_resume}\n\n"
+        "DRAFT COVER LETTER:\n"
+        "-----------------\n"
+        f"{draft_cover_letter}\n\n"
+        "CLIENT META (JSON):\n"
+        "-----------------\n"
+        f"{json.dumps(client_meta, indent=2)}\n"
+    )
+
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=system_prompt,
+        input=user_prompt,
+    )
+
+    # responses.create with output_text is available in the modern SDK
+    raw_text = resp.output_text
+
+    # Extract JSON block
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("Could not locate JSON object in OpenAI output.")
+
+    json_str = raw_text[start : end + 1]
+    data = json.loads(json_str)
+
+    return data
+
+
+def load_base_resume(job_dir: Path) -> str:
+    path = job_dir / "base_resume.txt"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing base_resume.txt in {job_dir}")
+    return path.read_text(encoding="utf-8")
+
+
+def load_job_descriptions(job_dir: Path) -> List[Tuple[Path, str]]:
+    """
+    Load all job_description_XX.txt files.
+
+    Returns a list of (path, text).
+    """
+    descriptions = []
+    for p in sorted(job_dir.glob("job_description_*.txt")):
+        text = p.read_text(encoding="utf-8")
+        descriptions.append((p, text))
+    # Fallback: single job_description.txt
+    single = job_dir / "job_description.txt"
+    if single.exists():
+        descriptions.append((single, single.read_text(encoding="utf-8")))
+    return descriptions
+
+
+def load_client_meta(job_dir: Path) -> dict:
+    meta_path = job_dir / "client_meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"raw": meta_path.read_text(encoding="utf-8")}
+
+
+def process_job(job_dir: Path) -> None:
+    """
+    Process a single JOB_xxxxx directory:
+      - generate drafts with Qwen
+      - polish & score with OpenAI
+      - repeat if score < MIN_SCORE (up to MAX_REVISION_ATTEMPTS)
+    """
+    log(f"Processing {job_dir}")
+
+    base_resume = load_base_resume(job_dir)
+    client_meta = load_client_meta(job_dir)
+    job_descs = load_job_descriptions(job_dir)
+
+    if not job_descs:
+        log(f"No job descriptions found in {job_dir}, skipping.")
+        return
+
+    for idx, (jd_path, jd_text) in enumerate(job_descs, start=1):
+        label = f"{idx:02}"
+        log(f"  -> Job {label}: {jd_path.name}")
+
+        attempts = 0
+        final_data = None
+
+        while attempts <= MAX_REVISION_ATTEMPTS:
+            attempts += 1
+            log(f"    Attempt {attempts} for job {label}...")
+
+            # 1) Qwen draft
+            drafts = call_qwen_draft(base_resume, jd_text, client_meta)
+
+            # 2) OpenAI polish + score
+            data = call_openai_polish_and_score(
+                base_resume=base_resume,
+                job_description=jd_text,
+                draft_resume=drafts["resume"],
+                draft_cover_letter=drafts["cover_letter"],
+                client_meta=client_meta,
+            )
+
+            score = int(data.get("score", 0))
+            notes = data.get("notes", "")
+            log(f"    OpenAI score: {score} (notes: {notes[:80]}...)")
+
+            # Save outputs for this attempt
+            tailored_resume_path = job_dir / f"tailored_resume_{label}.txt"
+            cover_letter_path = job_dir / f"cover_letter_{label}.txt"
+            score_path = job_dir / f"score_{label}.json"
+
+            tailored_resume_path.write_text(data["resume"].strip() + "\n", encoding="utf-8")
+            cover_letter_path.write_text(data["cover_letter"].strip() + "\n", encoding="utf-8")
+
+            score_payload = {
+                "score": score,
+                "notes": notes,
+                "attempts": attempts,
+                "job_description_file": jd_path.name,
+                "openai_model": OPENAI_MODEL,
+                "qwen_model": QWEN_MODEL,
+            }
+            score_path.write_text(json.dumps(score_payload, indent=2), encoding="utf-8")
+
+            if score >= MIN_SCORE:
+                log(f"    Job {label} reached score {score} >= {MIN_SCORE}, accepting.")
+                final_data = score_payload
+                break
+            else:
+                log(f"    Job {label} score {score} < {MIN_SCORE}, revising...")
+
+        if final_data is None:
+            log(f"    Job {label} did not reach {MIN_SCORE} after {MAX_REVISION_ATTEMPTS} attempts.")
+
+
+def main():
+    import sys
+
+    if len(sys.argv) != 2:
+        print("Usage: python3 packet_builder_qwen.py /path/to/JOB_xxxxx")
+        raise SystemExit(1)
+
+    job_dir = Path(sys.argv[1]).resolve()
+    if not job_dir.is_dir():
+        print(f"[BUILDER] Not a directory: {job_dir}")
+        raise SystemExit(1)
+
+    process_job(job_dir)
+
+
+if __name__ == "__main__":
+    main()

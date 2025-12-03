@@ -1,0 +1,26 @@
+# Python venvs
+venv/
+.env/
+.env*/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# FiverrMachine runtime data and outputs
+INTAKE/
+INCOMING/
+PROCESSING/
+DELIVERABLES/
+LOGS/
+*.zip
+
+# Playwright / browser stuff
+playwright/.cache/
+**/node_modules/
+
+# Editor / IDE junk
+.vscode/
+.idea/
+*.swp
+*.swo
