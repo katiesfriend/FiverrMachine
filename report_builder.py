@@ -179,7 +179,7 @@ def bucket_match_score(score: float, high_fit_threshold: Optional[float]) -> str
     """
     Bucket the job_scraper score into human labels.
 
-    Note: this is not the same as the LLM-based ATS,
+    Note: this is not the same as the LLM-based match score,
     but it's still a useful "job match" signal.
     """
     if high_fit_threshold is None:

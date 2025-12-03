@@ -12,7 +12,7 @@ Inputs (inside JOB_DIR):
 Outputs (inside JOB_DIR):
 - resume_jobXX.txt
 - cover_letter_jobXX.txt
-- score_jobXX.json         : includes ats_score, model info, notes, polishing flags
+- score_jobXX.json         : includes match_score, model info, notes, polishing flags
 
 Heavy lifting is done by Ollama with model qwen2.5:14b.
 Optional polishing is done by OpenAI if OPENAI_API_KEY is set.
@@ -23,7 +23,7 @@ import os
 import sys
 import glob
 import textwrap
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 from resume_loader import load_base_resume as _load_base_resume
 
 import requests
@@ -44,6 +44,20 @@ OPENAI_MODEL = os.environ.get("FIVERR_OPENAI_MODEL", "gpt-4o-mini")
 
 # Safety: we keep temperature modest so outputs are stable
 QWEN_TEMPERATURE = float(os.environ.get("FIVERR_QWEN_TEMPERATURE", "0.4"))
+
+# Match Score thresholds (configurable via env, with ATS fallbacks for backwards compatibility)
+TARGET_MATCH_SCORE = float(
+    os.environ.get(
+        "FIVERR_TARGET_MATCH_SCORE",
+        os.environ.get("FIVERR_ATS_TARGET", "88.0"),
+    )
+)
+LOW_FIT_FLOOR = float(
+    os.environ.get(
+        "FIVERR_LOW_FIT_FLOOR",
+        os.environ.get("FIVERR_ATS_LOW_FIT", "40.0"),
+    )
+)
 
 # -----------------------------
 # Helpers: file loading
@@ -88,7 +102,7 @@ def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]
     Call Ollama /api/chat with qwen2.5:14b to generate:
       - resume
       - cover_letter
-      - ats_score (0-100)
+      - match_score (0-100)
       - notes
 
     We instruct Qwen to answer in **strict JSON**.
@@ -96,7 +110,7 @@ def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]
     system_prompt = textwrap.dedent(
         """
         You are an expert resume and cover letter writer that specializes in
-        Applicant Tracking Systems (ATS) optimization and high-conversion job applications.
+        maximizing job Match Scores and high-conversion job applications.
 
         TASK:
         - Read the client's base resume.
@@ -104,7 +118,7 @@ def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]
         - Read any client preferences / metadata.
         - Produce a tailored resume and cover letter that match the job description and
           highlight the client's strengths honestly.
-        - Estimate an ATS compatibility score from 0 to 100.
+        - Estimate a Match Score from 0 to 100 (higher is a stronger fit).
         - Provide brief notes explaining why you scored it that way.
 
         IMPORTANT FORMATTING RULES:
@@ -112,7 +126,7 @@ def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]
         - Top-level JSON object must have EXACTLY these keys:
             - "resume"        (string, full resume text)
             - "cover_letter"  (string, full cover letter text)
-            - "ats_score"     (number between 0 and 100)
+            - "match_score"   (number between 0 and 100)
             - "notes"         (string, brief explanation)
         - Do NOT include backticks, markdown, or any extra commentary outside JSON.
         """
@@ -169,26 +183,30 @@ def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]
         decoded = {
             "resume": content,
             "cover_letter": "Unable to parse structured cover letter; raw model output used as resume.",
-            "ats_score": 80,
+            "match_score": 80,
             "notes": "Model did not return valid JSON. Used raw content as resume.",
         }
 
     # Normalize & validate fields
     resume = str(decoded.get("resume", "")).strip()
     cover_letter = str(decoded.get("cover_letter", "")).strip()
-    ats_score = decoded.get("ats_score", 80)
+    raw_score = decoded.get("match_score")
+    if raw_score is None:
+        # Backwards compatibility: models may still return ats_score
+        raw_score = decoded.get("ats_score", 80)
     try:
-        ats_score = float(ats_score)
+        raw_score = float(raw_score)
     except (TypeError, ValueError):
-        ats_score = 80.0
-    ats_score = max(0.0, min(100.0, ats_score))
+        raw_score = 80.0
+    raw_score = max(0.0, min(100.0, raw_score))
 
     notes = str(decoded.get("notes", "")).strip()
 
     return {
         "resume": resume,
         "cover_letter": cover_letter,
-        "ats_score": ats_score,
+        "match_score": raw_score,
+        "ats_score": raw_score,  # Deprecated alias for backward compatibility
         "notes": notes,
     }
 
@@ -198,18 +216,18 @@ def call_qwen_revision(
     client_meta: Dict[str, Any],
     current_resume: str,
     current_cover: str,
-    current_ats: float,
+    current_match_score: float,
 ) -> Dict[str, Any]:
     """
     Ask Qwen to revise an existing resume + cover letter to better match
-    the job description and improve ATS alignment, WITHOUT inventing facts.
+    the job description and improve the Match Score, WITHOUT inventing facts.
 
     Returns the same JSON structure as call_qwen_draft().
     """
     system_prompt = textwrap.dedent(
         """
         You are revising an existing resume and cover letter to improve
-        their match to a specific job description and increase ATS alignment.
+        their match to a specific job description and increase the Match Score.
 
         TASK:
         - Read the client's base resume.
@@ -219,7 +237,7 @@ def call_qwen_revision(
           while preserving all factual content and not adding fake achievements.
         - Focus on skills, tools, technologies, and responsibilities explicitly
           mentioned in the job description.
-        - Estimate an ATS compatibility score from 0 to 100.
+        - Estimate a Match Score from 0 to 100.
         - Provide brief notes explaining what you changed and why.
 
         IMPORTANT FORMATTING RULES:
@@ -227,7 +245,7 @@ def call_qwen_revision(
         - Top-level JSON object must have EXACTLY these keys:
             - "resume"        (string, full revised resume text)
             - "cover_letter"  (string, full revised cover letter text)
-            - "ats_score"     (number between 0 and 100)
+            - "match_score"   (number between 0 and 100)
             - "notes"         (string, brief explanation)
         - Do NOT include backticks, markdown, or any extra commentary outside JSON.
         """
@@ -250,8 +268,8 @@ def call_qwen_revision(
         CURRENT TAILORED COVER LETTER:
         {current_cover}
 
-        CURRENT ATS SCORE (approximate):
-        {current_ats}
+        CURRENT MATCH SCORE (approximate):
+        {current_match_score}
 
         Please revise the resume and cover letter now, following the instructions,
         and return ONLY the JSON object.
@@ -290,25 +308,28 @@ def call_qwen_revision(
         decoded = {
             "resume": current_resume,
             "cover_letter": current_cover,
-            "ats_score": current_ats,
+            "match_score": current_match_score,
             "notes": "Revision step: model did not return valid JSON, kept previous texts.",
         }
 
     resume = str(decoded.get("resume", current_resume)).strip()
     cover_letter = str(decoded.get("cover_letter", current_cover)).strip()
-    ats_score = decoded.get("ats_score", current_ats)
+    raw_score = decoded.get("match_score")
+    if raw_score is None:
+        raw_score = decoded.get("ats_score", current_match_score)
     try:
-        ats_score = float(ats_score)
+        raw_score = float(raw_score)
     except (TypeError, ValueError):
-        ats_score = current_ats
-    ats_score = max(0.0, min(100.0, ats_score))
+        raw_score = current_match_score
+    raw_score = max(0.0, min(100.0, raw_score))
 
     notes = str(decoded.get("notes", "")).strip()
 
     return {
         "resume": resume or current_resume,
         "cover_letter": cover_letter or current_cover,
-        "ats_score": ats_score,
+        "match_score": raw_score,
+        "ats_score": raw_score,  # Deprecated alias for backward compatibility
         "notes": notes,
     }
 
@@ -368,7 +389,7 @@ def maybe_polish_with_openai(text: str, kind: str) -> Tuple[str, bool]:
         # If OpenAI fails for any reason, just return original.
         return text, False
 # -----------------------------
-# ATS scoring (keyword coverage)
+# Match Score (skills + title + location)
 # -----------------------------
 
 _STOPWORDS = {
@@ -410,59 +431,174 @@ def _extract_bullet_lines(text: str):
     return lines
 
 
-def compute_ats_score(resume_text: str, jd_text: str) -> float:
-    """
-    Compute a deterministic ATS-style score (0-100) based on keyword coverage.
+def _dedupe_preserve_order(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        key = str(item).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(str(item).strip())
+    return ordered
 
-    - Take top N keywords from the job description.
-    - Measure how many appear anywhere in the resume.
-    - Give extra weight when those keywords appear in bullet-point lines.
-    """
-    jd_tokens = _tokenize(jd_text)
-    resume_tokens = _tokenize(resume_text)
 
-    if not jd_tokens or not resume_tokens:
-        return 0.0
+def _extract_client_skills(client_meta: Dict[str, Any], resume_text: str):
+    skills = []
+    for key in ("skills", "key_skills", "core_skills", "technical_skills", "keywords"):
+        val = client_meta.get(key)
+        if isinstance(val, list):
+            skills.extend([str(v) for v in val])
+        elif isinstance(val, str):
+            skills.extend([s.strip() for s in re.split(r"[,;\n]", val) if s.strip()])
 
-    # Frequency of JD tokens -> pick top N as "keywords"
-    jd_counts = Counter(jd_tokens)
-    # N is capped so we don't over-penalize very long JDs
-    top_keywords = [w for w, _ in jd_counts.most_common(60)]
-    keyword_set = set(top_keywords)
+    skills = _dedupe_preserve_order(skills)
+    if skills:
+        return skills
 
-    if not keyword_set:
-        return 0.0
-
-    resume_set = set(resume_tokens)
-
-    # Base coverage: how many JD keywords appear anywhere in the resume
-    covered_keywords = keyword_set.intersection(resume_set)
-    base_coverage_ratio = len(covered_keywords) / len(keyword_set)
-    base_score = base_coverage_ratio * 100.0
-
-    # Skill/achievement emphasis: look at bullet lines
+    # Fallback: infer top tokens from the resume (favor bullet lines)
+    token_source = []
     bullet_lines = _extract_bullet_lines(resume_text)
-    bullet_tokens = set()
     for line in bullet_lines:
-        bullet_tokens.update(_tokenize(line))
+        token_source.extend(_tokenize(line))
+    if not token_source:
+        token_source = _tokenize(resume_text)
 
-    bullet_hits = keyword_set.intersection(bullet_tokens)
-    if keyword_set:
-        bullet_ratio = len(bullet_hits) / len(keyword_set)
-    else:
-        bullet_ratio = 0.0
-    bullet_score = bullet_ratio * 100.0
+    counts = Counter(token_source)
+    inferred = [w for w, _ in counts.most_common(25)]
+    return inferred
 
-    # Blend: 70% global coverage, 30% bullets
-    blended = 0.7 * base_score + 0.3 * bullet_score
 
-    # Clamp 0–100
-    if blended < 0.0:
-        blended = 0.0
-    if blended > 100.0:
-        blended = 100.0
+def _extract_target_titles(client_meta: Dict[str, Any]):
+    titles = []
+    for key in ("target_roles", "preferred_titles", "titles", "role"):
+        val = client_meta.get(key)
+        if isinstance(val, list):
+            titles.extend([str(v) for v in val])
+        elif isinstance(val, str):
+            titles.extend([s.strip() for s in re.split(r"[,;/\n]", val) if s.strip()])
+    return _dedupe_preserve_order(titles)
 
-    return round(blended, 1)
+
+def _extract_job_title(jd_text: str) -> str:
+    for line in jd_text.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"(?i)^job\s*title\s*[:\-]\s*", "", cleaned)
+        return cleaned[:120]
+    return ""
+
+
+def _compute_title_similarity(job_title: str, target_titles) -> float:
+    if not job_title or not target_titles:
+        return 0.0
+
+    job_lower = job_title.lower()
+    job_tokens = set(_tokenize(job_title))
+    best = 0.0
+    for target in target_titles:
+        target_lower = target.lower()
+        if not target_lower:
+            continue
+        if target_lower in job_lower:
+            best = max(best, 1.0)
+            continue
+        target_tokens = set(_tokenize(target))
+        if not target_tokens:
+            continue
+        overlap = job_tokens.intersection(target_tokens)
+        ratio = len(overlap) / len(target_tokens)
+        best = max(best, ratio)
+    return best
+
+
+def _skill_in_job_description(skill: str, jd_tokens, jd_text_lower: str) -> bool:
+    skill_tokens = set(_tokenize(skill))
+    if not skill_tokens:
+        return False
+    if all(tok in jd_tokens for tok in skill_tokens):
+        return True
+    return skill.lower() in jd_text_lower
+
+
+def _extract_locations(client_meta: Dict[str, Any]):
+    locations = []
+    for key in (
+        "location",
+        "location_city",
+        "location_state",
+        "location_country",
+        "location_zip",
+        "preferred_location",
+        "preferred_locations",
+    ):
+        val = client_meta.get(key)
+        if isinstance(val, list):
+            locations.extend([str(v) for v in val])
+        elif isinstance(val, str):
+            locations.extend([s.strip() for s in re.split(r"[,;/\n]", val) if s.strip()])
+    return _dedupe_preserve_order(locations)
+
+
+def _is_remote_friendly(client_meta: Dict[str, Any]) -> bool:
+    pref = str(client_meta.get("remote_preference", "")).lower()
+    return any(word in pref for word in ["remote", "hybrid", "either", "flexible"])
+
+
+def compute_match_score(
+    resume_text: str,
+    jd_text: str,
+    client_meta: Optional[Dict[str, Any]] = None,
+) -> float:
+    """
+    Compute a deterministic Match Score (0-100) blending:
+
+    - Skill coverage (largest weight): percentage of client skills present in the JD.
+    - Title similarity (medium weight): overlap between target titles and the JD title line.
+    - Location/remote alignment (small weight): simple boosts for location or remote fit.
+    """
+
+    if not resume_text or not jd_text:
+        return 0.0
+
+    client_meta = client_meta or {}
+    jd_tokens = set(_tokenize(jd_text))
+    jd_text_lower = jd_text.lower()
+
+    # Skill coverage
+    skills = _extract_client_skills(client_meta, resume_text)
+    skill_hits = sum(
+        1 for skill in skills if _skill_in_job_description(skill, jd_tokens, jd_text_lower)
+    )
+    skill_ratio = skill_hits / len(skills) if skills else 0.0
+    skill_score = skill_ratio * 70.0
+
+    # Title similarity
+    job_title = _extract_job_title(jd_text)
+    target_titles = _extract_target_titles(client_meta)
+    title_similarity = _compute_title_similarity(job_title, target_titles)
+    title_score = title_similarity * 20.0
+
+    # Location / remote sanity
+    remote_in_jd = "remote" in jd_text_lower or "work from home" in jd_text_lower
+    remote_pref = _is_remote_friendly(client_meta)
+    location_terms = _extract_locations(client_meta)
+    location_hit = any(term.lower() in jd_text_lower for term in location_terms)
+
+    location_score = 0.0
+    if remote_in_jd and remote_pref:
+        location_score = 10.0
+    elif location_hit:
+        location_score = 8.0
+    elif remote_in_jd:
+        location_score = 5.0
+    elif remote_pref:
+        location_score = 3.0
+
+    score = skill_score + title_score + location_score
+    score = max(0.0, min(100.0, round(score, 1)))
+    return score
 
 def process_job(job_dir: str) -> None:
     # High-level job banner
@@ -487,8 +623,8 @@ def process_job(job_dir: str) -> None:
 
     # Self-revision parameters
     max_revisions = int(os.environ.get("FIVERR_MAX_REVISIONS", "2"))
-    ats_target = float(os.environ.get("FIVERR_ATS_TARGET", "92"))
-    low_fit_floor = float(os.environ.get("FIVERR_ATS_LOW_FIT", "10"))
+    target_match_score = TARGET_MATCH_SCORE
+    low_fit_floor = LOW_FIT_FLOOR
 
     # Stage 2: per-job generation
     total = len(jd_files)
@@ -509,37 +645,37 @@ def process_job(job_dir: str) -> None:
         cover_text = draft["cover_letter"]
 
         # Keep the model's own guess separately
-        model_raw_ats = draft["ats_score"]
+        model_raw_match = draft.get("match_score", draft.get("ats_score", 0.0))
         notes = draft["notes"] or ""
         revisions_used = 0
+        match_score = compute_match_score(resume_text, jd_text, client_meta)
 
         # -----------------------------
         # Self-revision loop (pre-polish)
         # -----------------------------
         while revisions_used < max_revisions:
-            ats_score = compute_ats_score(resume_text, jd_text)
 
-            # If ATS is extremely low, treat this as a low-fit job and skip revisions.
-            if ats_score < low_fit_floor:
+            # If Match Score is extremely low, treat this as a low-fit job and skip revisions.
+            if match_score < low_fit_floor:
                 print(
-                    f"[BUILDER]   -> ATS={ats_score:.1f} is below low-fit floor {low_fit_floor:.1f}. "
+                    f"[BUILDER]   -> MatchScore={match_score:.1f} is below low-fit floor {low_fit_floor:.1f}. "
                     f"Skipping revisions for this job.",
                     flush=True,
                 )
                 if notes:
                     notes += "\n"
                 notes += (
-                    f"Low-fit job: ATS={ats_score:.1f} below low-fit floor "
+                    f"Low-fit job: MatchScore={match_score:.1f} below low-fit floor "
                     f"{low_fit_floor:.1f}; no revisions attempted."
                 )
                 break
 
             # If we've already hit the target, no need to revise.
-            if ats_score >= ats_target:
+            if match_score >= target_match_score:
                 break
 
             print(
-                f"[BUILDER]   -> ATS={ats_score:.1f} < target {ats_target:.1f}, "
+                f"[BUILDER]   -> MatchScore={match_score:.1f} < target {target_match_score:.1f}, "
                 f"requesting revision {revisions_used + 1}...",
                 flush=True,
             )
@@ -550,12 +686,12 @@ def process_job(job_dir: str) -> None:
                 client_meta=client_meta,
                 current_resume=resume_text,
                 current_cover=cover_text,
-                current_ats=ats_score,
+                current_match_score=match_score,
             )
 
             resume_text = revision["resume"]
             cover_text = revision["cover_letter"]
-            model_raw_ats = revision["ats_score"]
+            model_raw_match = revision.get("match_score", revision.get("ats_score", model_raw_match))
             rev_note = revision.get("notes", "").strip()
             if rev_note:
                 if notes:
@@ -563,17 +699,18 @@ def process_job(job_dir: str) -> None:
                 notes += f"Revision {revisions_used + 1}: {rev_note}"
 
             revisions_used += 1
+            match_score = compute_match_score(resume_text, jd_text, client_meta)
 
-        # Compute final ATS *before* polish (for reference)
-        ats_score = compute_ats_score(resume_text, jd_text)
+        # Compute final Match Score *before* polish (for reference)
+        match_score = compute_match_score(resume_text, jd_text, client_meta)
 
         # Optional polishing
         print(f"[BUILDER]   -> Optional OpenAI polish for job {job_label}...", flush=True)
         resume_text, resume_polished = maybe_polish_with_openai(resume_text, "resume")
         cover_text, cover_polished = maybe_polish_with_openai(cover_text, "cover_letter")
 
-        # Recompute ATS after polish (final stored score)
-        ats_score = compute_ats_score(resume_text, jd_text)
+        # Recompute Match Score after polish (final stored score)
+        match_score = compute_match_score(resume_text, jd_text, client_meta)
 
         # Write outputs
         print(f"[BUILDER]   -> Writing outputs for job {job_label}...", flush=True)
@@ -588,9 +725,11 @@ def process_job(job_dir: str) -> None:
             f.write(cover_text)
 
         score_payload = {
-            "ats_score": ats_score,
-            "model_raw_ats_score": model_raw_ats,
-            "ats_target": ats_target,
+            "match_score": match_score,
+            "ats_score": match_score,  # Deprecated alias for backward compatibility
+            "model_raw_match_score": model_raw_match,
+            "target_match_score": target_match_score,
+            "low_fit_floor": low_fit_floor,
             "revisions_used": revisions_used,
             "notes": notes,
             "model": OLLAMA_MODEL,
@@ -606,7 +745,7 @@ def process_job(job_dir: str) -> None:
 
         print(
             f"[BUILDER]   -> Done job {job_label}: "
-            f"ATS={ats_score}, revisions_used={revisions_used}, "
+            f"MatchScore={match_score}, revisions_used={revisions_used}, "
             f"OpenAI polish={'yes' if (resume_polished or cover_polished) else 'no'}",
             flush=True,
         )
