@@ -17,6 +17,7 @@ import time
 import uuid
 import shutil
 import subprocess
+import os
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -26,9 +27,12 @@ INTAKE = BASE / "INTAKE"
 PROCESSING = BASE / "PROCESSING"
 LOGS = BASE / "LOGS"
 
-INTAKE.mkdir(parents=True, exist_ok=True)
-PROCESSING.mkdir(parents=True, exist_ok=True)
-LOGS.mkdir(parents=True, exist_ok=True)
+# Avoid side effects in CI or non-mykl environments:
+# only create these directories when NOT running under GitHub Actions.
+if os.getenv("GITHUB_ACTIONS") != "true":
+    INTAKE.mkdir(parents=True, exist_ok=True)
+    PROCESSING.mkdir(parents=True, exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
 
 
 def log(msg: str) -> None:

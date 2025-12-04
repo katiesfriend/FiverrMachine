@@ -89,6 +89,11 @@ def main():
         "deliverable_packager",
         [str(VENV_PY), str(BASE / "deliverable_packager.py"), str(processing_job_dir)]
     ))
+    # 5) Career Insights Letter
+    steps.append(run_step(
+        "career_insights",
+        [str(VENV_PY), str(BASE / "career_insights.py"), str(processing_job_dir)]
+    ))
 
     # (Optional, later) 4) Upload to Google Drive, notify phone
     # steps.append(run_step(
