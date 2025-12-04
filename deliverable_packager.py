@@ -17,9 +17,11 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-BASE = Path("/home/mykl/webui/filesystem/FiverrMachine")
+BASE = Path(__file__).resolve().parent
 FINAL = BASE / "FINAL_DELIVERY"
 DELIVERABLES = BASE / "DELIVERABLES"
+
+REPORT_FILENAME = "Job_Search_Report.md"
 
 
 def package_tree(root: Path) -> Path:
@@ -35,8 +37,16 @@ def package_tree(root: Path) -> Path:
     zip_path = DELIVERABLES / f"fiverr_deliverables_{root_name}_{timestamp}.zip"
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        report_path = root / REPORT_FILENAME
+        if report_path.exists():
+            zf.write(report_path, f"01_{REPORT_FILENAME}")
+        else:
+            print(f"[PACKAGER] WARNING: Report file not found at {report_path}")
+
         for item in root.rglob("*"):
             if item.is_file():
+                if item.resolve() == report_path.resolve():
+                    continue
                 arcname = item.relative_to(root)
                 zf.write(item, arcname)
 
