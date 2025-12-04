@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+REPORT_FILENAME = "Job_Search_Report.md"
+
+
 def log(msg: str) -> None:
     print(f"[REPORT] {msg}", flush=True)
 
@@ -372,15 +375,14 @@ def build_markdown_report(
 # Main
 # -----------------------------
 
-def main() -> None:
-    if len(sys.argv) != 2:
-        print("Usage: report_builder.py /path/to/JOB_xxxx", file=sys.stderr)
-        sys.exit(1)
-
-    job_dir = Path(sys.argv[1]).resolve()
-    if not job_dir.exists():
-        print(f"Job directory does not exist: {job_dir}", file=sys.stderr)
-        sys.exit(1)
+def build_report(job_dir: Path) -> Path:
+    """
+    Build the Job Search Report for the given job directory and
+    return the Path to the report file.
+    """
+    job_dir = job_dir.resolve()
+    if not job_dir.exists() or not job_dir.is_dir():
+        raise FileNotFoundError(f"Job directory does not exist: {job_dir}")
 
     log(f"Building report for job folder: {job_dir}")
 
@@ -388,14 +390,30 @@ def main() -> None:
     jobs_info = parse_job_sources(job_dir)
 
     if not jobs_info["jobs"]:
-        log("No jobs found in job_sources.txt; aborting report creation.")
-        sys.exit(0)
+        log("No jobs found in job_sources.txt; creating an empty report.")
 
     report_md = build_markdown_report(job_dir, client_meta, jobs_info)
-    out_path = job_dir / "final_report.md"
+    out_path = job_dir / REPORT_FILENAME
     out_path.write_text(report_md, encoding="utf-8")
 
     log(f"Report written to {out_path}")
+    return out_path
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print("Usage: report_builder.py /path/to/JOB_xxxx", file=sys.stderr)
+        sys.exit(1)
+
+    job_dir = Path(sys.argv[1]).resolve()
+
+    try:
+        report_path = build_report(job_dir)
+    except Exception as exc:  # noqa: BLE001
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+    print(report_path)
 
 
 if __name__ == "__main__":

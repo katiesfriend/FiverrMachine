@@ -72,13 +72,19 @@ def main():
         [str(VENV_PY), str(BASE / "packet_builder_qwen.py"), str(processing_job_dir)]
     ))
 
-    # 3) Generate PDFs (resume + cover letters) inside the job folder
+    # 3) Build the Job Search Report
+    steps.append(run_step(
+        "report_builder",
+        [str(VENV_PY), str(BASE / "report_builder.py"), str(processing_job_dir)]
+    ))
+
+    # 4) Generate PDFs (resume + cover letters) inside the job folder
     steps.append(run_step(
         "generate_pdfs",
         [str(VENV_PY), str(BASE / "generate_pdfs.py"), job_folder_name]
     ))
 
-    # 4) Package deliverables (zip, scoring json, PDFs, etc.)
+    # 5) Package deliverables (zip, scoring json, PDFs, etc.)
     steps.append(run_step(
         "deliverable_packager",
         [str(VENV_PY), str(BASE / "deliverable_packager.py"), str(processing_job_dir)]
@@ -102,6 +108,7 @@ def main():
         "job_folder": job_folder_name,
         "processing_dir": str(processing_job_dir),
         "deliverables_dir": str(DELIVERABLES),
+        "report_file": str(processing_job_dir / "Job_Search_Report.md"),
         "steps": steps,
     }))
 
