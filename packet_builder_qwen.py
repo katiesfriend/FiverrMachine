@@ -39,8 +39,11 @@ from collections import Counter
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("FIVERR_QWEN_MODEL", "qwen2.5:14b")
 
-# OpenAI polishing config (optional)
-OPENAI_MODEL = os.environ.get("FIVERR_OPENAI_MODEL", "gpt-4o-mini")
+# OpenAI models:
+# - Draft: GPT-4.1-mini (cheap, good structure)
+# - Polish: GPT-5.1 (expensive, high quality)
+OPENAI_DRAFT_MODEL = os.environ.get("FIVERR_OPENAI_DRAFT_MODEL", "gpt-4.1-mini")
+OPENAI_MODEL = os.environ.get("FIVERR_OPENAI_MODEL", "gpt-5.1")
 
 # Safety: we keep temperature modest so outputs are stable
 QWEN_TEMPERATURE = float(os.environ.get("FIVERR_QWEN_TEMPERATURE", "0.4"))
@@ -59,9 +62,173 @@ LOW_FIT_FLOOR = float(
     )
 )
 
+def _strip_markdown_fences(text: str) -> str:
+    """
+    If the model wraps JSON in ``` or ```json fences, strip them
+    so json.loads() can work on the inner content.
+    """
+    text = text.strip()
+    if not text.startswith("```"):
+        return text
+
+    lines = text.splitlines()
+    if not lines:
+        return text
+
+    first_line = lines[0]
+    if not first_line.startswith("```"):
+        return text
+
+    closing_index = None
+    for i in range(len(lines) - 1, 0, -1):
+        if lines[i].startswith("```"):
+            closing_index = i
+            break
+
+    if closing_index is None or closing_index <= 0:
+        return text
+
+    inner = "\n".join(lines[1:closing_index])
+    return inner.strip()
+
 # -----------------------------
 # Helpers: file loading
 # -----------------------------
+def scrub_unverified_certifications(base_resume: str, resume_text: str) -> str:
+    """
+    Remove certification lines from the final resume if they are not
+    literally present in the base resume text.
+
+    Assumes a section labeled 'Certifications' followed by bullet lines.
+    Any bullet whose text is not found (case-insensitive) in base_resume
+    will be dropped.
+    """
+    base_lower = base_resume.lower()
+    lines = resume_text.splitlines()
+    out_lines: List[str] = []
+    in_certs = False
+
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        # Detect start of Certifications section
+        if lower.startswith("certifications"):
+            in_certs = True
+            out_lines.append(line)
+            continue
+
+        if in_certs:
+            # If we hit a blank line, or an obvious new section heading,
+            # end the Certifications section.
+            if stripped == "" or stripped.lower().endswith("summary") or stripped.lower().endswith("experience"):
+                out_lines.append(line)
+                in_certs = False
+                continue
+
+            # Handle bullet vs plain text lines
+            content = stripped
+            if stripped.startswith(("-", "•", "*")):
+                content = stripped.lstrip("-•*").strip()
+
+            # If the bullet text doesn't appear in the base resume, drop it.
+            if content and content.lower() not in base_lower:
+                continue
+
+            # Otherwise keep it
+            out_lines.append(line)
+            continue
+
+        # Outside Certifications section, just pass lines through
+        out_lines.append(line)
+
+    return "\n".join(out_lines)
+def extract_education_block(text: str) -> Optional[str]:
+    """
+    Pull out the Education section from the base resume text.
+
+    We look for a line starting with 'Education' and then collect
+    all following lines up until the next obvious section heading
+    (e.g., 'Certifications', 'Notable Achievements', etc.).
+    """
+    lines = text.splitlines()
+    out: List[str] = []
+    in_edu = False
+
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if not in_edu:
+            if lower.startswith("education"):
+                in_edu = True
+                out.append(line)
+            continue
+
+        # Once we're inside Education, stop when we hit the next section.
+        if (
+            lower.startswith("certifications")
+            or lower.startswith("notable achievements")
+            or lower.endswith("summary")
+            or lower.endswith("experience")
+        ):
+            break
+
+        out.append(line)
+
+    return "\n".join(out) if out else None
+
+
+def force_education_from_base(base_resume: str, resume_text: str) -> str:
+    """
+    Replace the Education section in the generated resume with the exact
+    Education block from the base resume. If no Education section exists
+    in the generated resume, we append the base Education block at the end.
+    """
+    edu_block = extract_education_block(base_resume)
+    if not edu_block:
+        return resume_text  # nothing to enforce
+
+    lines = resume_text.splitlines()
+    out: List[str] = []
+    in_edu = False
+    replaced = False
+
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if not in_edu:
+            if lower.startswith("education"):
+                # Start of the existing Education section: replace it once.
+                in_edu = True
+                if not replaced:
+                    out.append(edu_block)
+                    replaced = True
+                # Skip the original 'Education' line and its content;
+                # they'll be replaced by edu_block.
+                continue
+            else:
+                out.append(line)
+        else:
+            # We're in the old Education section. Skip its lines until the next section.
+            if (
+                lower.startswith("certifications")
+                or lower.startswith("notable achievements")
+                or lower.endswith("summary")
+                or lower.endswith("experience")
+            ):
+                in_edu = False
+                out.append(line)  # keep the next section heading
+            # otherwise, swallow lines inside old Education section
+
+    # If we never found an Education heading in the generated resume,
+    # append the base Education block at the end.
+    if not replaced:
+        out.append("")
+        out.append(edu_block)
+
+    return "\n".join(out)
 
 def load_base_resume(job_dir: str) -> str:
     """
@@ -99,36 +266,58 @@ def load_job_descriptions(job_dir: str):
 
 def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Call Ollama /api/chat with qwen2.5:14b to generate:
+    Draft tailored resume + cover letter using OpenAI GPT-4.1-mini
+    instead of Qwen/Ollama.
+
+    Returns a dict with:
       - resume
       - cover_letter
-      - match_score (0-100)
+      - match_score
       - notes
-
-    We instruct Qwen to answer in **strict JSON**.
     """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set; cannot generate resume draft.")
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as e:
+        raise RuntimeError("openai package is not installed in this environment.") from e
+
+    client = OpenAI(api_key=api_key)
+
     system_prompt = textwrap.dedent(
         """
-        You are an expert resume and cover letter writer that specializes in
-        maximizing job Match Scores and high-conversion job applications.
+        You are an expert resume and cover letter writer who specializes
+        in honest, high-conversion applications.
 
-        TASK:
-        - Read the client's base resume.
-        - Read the target job description.
-        - Read any client preferences / metadata.
-        - Produce a tailored resume and cover letter that match the job description and
-          highlight the client's strengths honestly.
-        - Estimate a Match Score from 0 to 100 (higher is a stronger fit).
-        - Provide brief notes explaining why you scored it that way.
+        Your job:
 
-        IMPORTANT FORMATTING RULES:
-        - Respond in VALID JSON ONLY.
-        - Top-level JSON object must have EXACTLY these keys:
-            - "resume"        (string, full resume text)
-            - "cover_letter"  (string, full cover letter text)
-            - "match_score"   (number between 0 and 100)
-            - "notes"         (string, brief explanation)
-        - Do NOT include backticks, markdown, or any extra commentary outside JSON.
+        - Use ONLY facts present in the base resume and client metadata.
+        - NEVER invent or upgrade:
+            * employers
+            * job titles
+            * dates
+            * degrees
+            * certifications
+            * tools / technologies
+        - Use the job description ONLY to:
+            * choose which existing facts to highlight
+            * mirror relevant terminology and focus
+        - Do NOT copy or restate the job posting as the resume.
+        - Do NOT include salary, posting dates, or sections like
+          "Responsibilities" / "Qualifications" copied from the job ad.
+
+        OUTPUT FORMAT (STRICT):
+
+        Respond with a SINGLE valid JSON object with EXACTLY these keys:
+
+        - "resume"        (string, full candidate resume)
+        - "cover_letter"  (string, full cover letter)
+        - "match_score"   (number 0–100)
+        - "notes"         (string, brief explanation)
+
+        No markdown, no code fences, no extra commentary outside the JSON.
         """
     ).strip()
 
@@ -137,76 +326,69 @@ def call_qwen_draft(base_resume: str, job_desc: str, client_meta: Dict[str, Any]
         CLIENT METADATA (JSON):
         {json.dumps(client_meta, indent=2)}
 
-        BASE RESUME:
+        BASE RESUME (CANDIDATE FACTS):
         {base_resume}
 
-        JOB DESCRIPTION:
+        JOB DESCRIPTION (TARGET ROLE):
         {job_desc}
 
-        Please generate the JSON response now.
+        Please:
+        1) Tailor the RESUME to this job using ONLY candidate-supported facts.
+        2) Write a COVER LETTER that sells the candidate for this role.
+        3) Estimate a numeric MATCH_SCORE between 0 and 100.
+        4) Explain key tailoring decisions in NOTES.
         """
     ).strip()
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
+    completion = client.chat.completions.create(
+        model=OPENAI_DRAFT_MODEL,
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "stream": False,
-        "options": {
-            "temperature": QWEN_TEMPERATURE
-        },
-    }
+        temperature=QWEN_TEMPERATURE,
+    )
 
-    url = f"{OLLAMA_URL}/api/chat"
-    resp = requests.post(url, json=payload, timeout=180)
-    resp.raise_for_status()
-    data = resp.json()
+    content = completion.choices[0].message.content or ""
+    content = _strip_markdown_fences(content.strip())
 
-    # Ollama native format: {"message": {"role": "...", "content": "..."}, ...}
-    content = ""
-    if isinstance(data, dict):
-        msg = data.get("message") or {}
-        content = msg.get("content", "") if isinstance(msg, dict) else ""
-    if not content:
-        raise RuntimeError(f"Ollama returned empty message content: {data}")
-
-    content = content.strip()
-
-    # Try to parse Qwen's JSON
+    # Try to parse JSON
     try:
         decoded = json.loads(content)
     except json.JSONDecodeError:
-        # Fallback: wrap raw text as resume, create generic cover letter & score
-        # This keeps pipeline alive even if model drifts from strict JSON.
-        decoded = {
-            "resume": content,
-            "cover_letter": "Unable to parse structured cover letter; raw model output used as resume.",
-            "match_score": 80,
-            "notes": "Model did not return valid JSON. Used raw content as resume.",
-        }
+        decoded = {}
 
-    # Normalize & validate fields
+    if not isinstance(decoded, dict):
+        decoded = {}
+
     resume = str(decoded.get("resume", "")).strip()
     cover_letter = str(decoded.get("cover_letter", "")).strip()
-    raw_score = decoded.get("match_score")
-    if raw_score is None:
-        # Backwards compatibility: models may still return ats_score
-        raw_score = decoded.get("ats_score", 80)
+    raw_score = decoded.get("match_score", decoded.get("ats_score", 80))
     try:
         raw_score = float(raw_score)
     except (TypeError, ValueError):
         raw_score = 80.0
     raw_score = max(0.0, min(100.0, raw_score))
-
     notes = str(decoded.get("notes", "")).strip()
+
+    # Safety fallback: never dump a job description blob as "the resume".
+    if not resume:
+        resume = base_resume
+        if notes:
+            notes += "\n"
+        notes += "Draft step: model output missing/invalid 'resume'; fell back to base resume text."
+
+    if not cover_letter:
+        cover_letter = (
+            "Cover letter could not be generated automatically; "
+            "please draft manually based on the resume and job description."
+        )
 
     return {
         "resume": resume,
         "cover_letter": cover_letter,
         "match_score": raw_score,
-        "ats_score": raw_score,  # Deprecated alias for backward compatibility
+        "ats_score": raw_score,
         "notes": notes,
     }
 
@@ -219,35 +401,43 @@ def call_qwen_revision(
     current_match_score: float,
 ) -> Dict[str, Any]:
     """
-    Ask Qwen to revise an existing resume + cover letter to better match
-    the job description and improve the Match Score, WITHOUT inventing facts.
+    Ask GPT-4.1-mini to revise an existing resume + cover letter to better
+    match the job description, without inventing any new facts.
 
     Returns the same JSON structure as call_qwen_draft().
     """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set; cannot generate revision.")
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as e:
+        raise RuntimeError("openai package is not installed in this environment.") from e
+
+    client = OpenAI(api_key=api_key)
+
     system_prompt = textwrap.dedent(
         """
         You are revising an existing resume and cover letter to improve
         their match to a specific job description and increase the Match Score.
 
-        TASK:
-        - Read the client's base resume.
-        - Read the target job description.
-        - Read the CURRENT tailored resume and cover letter.
-        - Improve keyword alignment and phrasing so they better match the job,
-          while preserving all factual content and not adding fake achievements.
-        - Focus on skills, tools, technologies, and responsibilities explicitly
-          mentioned in the job description.
-        - Estimate a Match Score from 0 to 100.
-        - Provide brief notes explaining what you changed and why.
+        RULES:
 
-        IMPORTANT FORMATTING RULES:
-        - Respond in VALID JSON ONLY.
-        - Top-level JSON object must have EXACTLY these keys:
-            - "resume"        (string, full revised resume text)
-            - "cover_letter"  (string, full revised cover letter text)
-            - "match_score"   (number between 0 and 100)
-            - "notes"         (string, brief explanation)
-        - Do NOT include backticks, markdown, or any extra commentary outside JSON.
+        - You may NOT invent or upgrade any facts about the candidate.
+        - You must stay within the employers, titles, dates, degrees,
+          certifications, and tools present in the BASE RESUME / metadata.
+        - Use the job description to improve keyword alignment and phrasing,
+          not to fabricate new experience.
+        - Do NOT copy long sections of the job ad into the resume verbatim.
+
+        OUTPUT FORMAT (STRICT):
+
+        Respond with a SINGLE valid JSON object with EXACTLY these keys:
+        - "resume"        (string, full revised resume text)
+        - "cover_letter"  (string, full revised cover letter text)
+        - "match_score"   (number 0–100)
+        - "notes"         (string, brief explanation of changes)
         """
     ).strip()
 
@@ -256,81 +446,66 @@ def call_qwen_revision(
         CLIENT METADATA (JSON):
         {json.dumps(client_meta, indent=2)}
 
-        BASE RESUME:
+        BASE RESUME (CANDIDATE FACTS):
         {base_resume}
 
-        JOB DESCRIPTION:
+        JOB DESCRIPTION (TARGET ROLE):
         {job_desc}
 
         CURRENT TAILORED RESUME:
         {current_resume}
 
-        CURRENT TAILORED COVER LETTER:
+        CURRENT COVER LETTER:
         {current_cover}
 
-        CURRENT MATCH SCORE (approximate):
+        CURRENT MATCH SCORE (HEURISTIC):
         {current_match_score}
 
-        Please revise the resume and cover letter now, following the instructions,
-        and return ONLY the JSON object.
+        Please:
+        1) Revise the RESUME and COVER LETTER to better fit this job,
+           WITHOUT inventing any new facts.
+        2) Improve keyword alignment and clarity.
+        3) Estimate an updated MATCH_SCORE between 0 and 100.
+        4) Explain your key changes in NOTES.
         """
     ).strip()
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
+    completion = client.chat.completions.create(
+        model=OPENAI_DRAFT_MODEL,
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "stream": False,
-        "options": {
-            "temperature": QWEN_TEMPERATURE
-        },
-    }
+        temperature=QWEN_TEMPERATURE,
+    )
 
-    url = f"{OLLAMA_URL}/api/chat"
-    resp = requests.post(url, json=payload, timeout=180)
-    resp.raise_for_status()
-    data = resp.json()
-
-    content = ""
-    if isinstance(data, dict):
-        msg = data.get("message") or {}
-        content = msg.get("content", "") if isinstance(msg, dict) else ""
-    if not content:
-        raise RuntimeError(f"Ollama returned empty message content (revision): {data}")
-
-    content = content.strip()
+    content = completion.choices[0].message.content or ""
+    content = _strip_markdown_fences(content.strip())
 
     try:
         decoded = json.loads(content)
     except json.JSONDecodeError:
-        decoded = {
-            "resume": current_resume,
-            "cover_letter": current_cover,
-            "match_score": current_match_score,
-            "notes": "Revision step: model did not return valid JSON, kept previous texts.",
-        }
+        decoded = {}
+
+    if not isinstance(decoded, dict):
+        decoded = {}
 
     resume = str(decoded.get("resume", current_resume)).strip()
     cover_letter = str(decoded.get("cover_letter", current_cover)).strip()
-    raw_score = decoded.get("match_score")
-    if raw_score is None:
-        raw_score = decoded.get("ats_score", current_match_score)
+    raw_score = decoded.get("match_score", decoded.get("ats_score", current_match_score))
     try:
         raw_score = float(raw_score)
     except (TypeError, ValueError):
         raw_score = current_match_score
     raw_score = max(0.0, min(100.0, raw_score))
-
     notes = str(decoded.get("notes", "")).strip()
 
     return {
         "resume": resume or current_resume,
         "cover_letter": cover_letter or current_cover,
         "match_score": raw_score,
-        "ats_score": raw_score,  # Deprecated alias for backward compatibility
-        "notes": notes,
+        "ats_score": raw_score,
+        "notes": notes or "Revision step: model returned no notes.",
     }
 
 
@@ -708,6 +883,9 @@ def process_job(job_dir: str) -> None:
         print(f"[BUILDER]   -> Optional OpenAI polish for job {job_label}...", flush=True)
         resume_text, resume_polished = maybe_polish_with_openai(resume_text, "resume")
         cover_text, cover_polished = maybe_polish_with_openai(cover_text, "cover_letter")
+
+        # Hard-guard: remove any certifications not present in the base resume
+        resume_text = scrub_unverified_certifications(base_resume, resume_text)
 
         # Recompute Match Score after polish (final stored score)
         match_score = compute_match_score(resume_text, jd_text, client_meta)
