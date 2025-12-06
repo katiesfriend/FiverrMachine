@@ -7,12 +7,6 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
-# Try to import the LaTeX resume renderer (optional)
-try:
-    from latex_resume_builder import render_plaintext_resume_to_pdf
-except Exception:
-    render_plaintext_resume_to_pdf = None
-
 
 BASE_DIR = "/home/mykl/webui/filesystem/FiverrMachine"
 PROCESSING_DIR = os.path.join(BASE_DIR, "PROCESSING")
@@ -20,7 +14,7 @@ PROCESSING_DIR = os.path.join(BASE_DIR, "PROCESSING")
 
 def draw_multiline_text(c, text, left_margin=1 * inch, top_margin=10 * inch, line_height=14):
     """
-    Very simple text renderer: wraps on '\\n', moves down each line.
+    Very simple text renderer: wraps on '\n', moves down each line.
     No fancy layout yet; this keeps things robust.
     """
     lines = text.splitlines()
@@ -38,11 +32,6 @@ def draw_multiline_text(c, text, left_margin=1 * inch, top_margin=10 * inch, lin
 
 
 def render_text_file_to_pdf(txt_path, pdf_path, title=None):
-    """
-    Basic ReportLab-based PDF generator used for:
-      - Fallback if LaTeX is missing / fails
-      - Cover letters (for now)
-    """
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
@@ -71,13 +60,6 @@ def generate_pdfs_for_job_folder(job_folder_path):
     """
     Finds resume_jobXX.txt and cover_letter_jobXX.txt in a job folder
     and generates matching PDFs.
-
-    Resumes:
-        - Prefer LaTeX (modern layout)
-        - Fallback to basic ReportLab if LaTeX fails or is unavailable
-
-    Cover letters:
-        - Use basic ReportLab renderer for now
     """
     if not os.path.isdir(job_folder_path):
         raise RuntimeError(f"Job folder does not exist: {job_folder_path}")
@@ -92,27 +74,13 @@ def generate_pdfs_for_job_folder(job_folder_path):
 
     print(f"[PDF] Generating PDFs in: {job_folder_path}")
 
-    # ----- Resumes (LaTeX preferred) -----
     for txt_name in resumes:
         txt_path = os.path.join(job_folder_path, txt_name)
         pdf_name = txt_name.replace(".txt", ".pdf")
         pdf_path = os.path.join(job_folder_path, pdf_name)
-
-        # If we have the LaTeX builder, try that first
-        if render_plaintext_resume_to_pdf is not None:
-            try:
-                render_plaintext_resume_to_pdf(txt_path, pdf_path, doc_title="Tailored Resume")
-                print(f"[PDF] Resume (LaTeX) -> {pdf_name}")
-                continue  # Done with this resume
-            except RuntimeError as e:
-                # Log failure, fall back to basic renderer
-                print(f"[PDF] LaTeX resume generation failed for {pdf_name}: {e}. Falling back to basic renderer.")
-
-        # Fallback: simple ReportLab renderer
-        print(f"[PDF] Resume (basic) -> {pdf_name}")
+        print(f"[PDF] Resume -> {pdf_name}")
         render_text_file_to_pdf(txt_path, pdf_path, title="Tailored Resume")
 
-    # ----- Cover letters (basic for now) -----
     for txt_name in covers:
         txt_path = os.path.join(job_folder_path, txt_name)
         pdf_name = txt_name.replace(".txt", ".pdf")
