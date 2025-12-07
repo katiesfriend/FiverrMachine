@@ -77,6 +77,12 @@ def main():
         "generate_pdfs",
         [str(VENV_PY), str(BASE / "generate_pdfs.py"), job_folder_name]
     ))
+    
+    # 3b) Generate LaTeX-styled cover letters
+    steps.append(run_step(
+        "cover_letter_latex",
+        [str(VENV_PY), str(BASE / "cover_letter_latex.py"), str(processing_job_dir)]
+    ))
 
     # 4) Package deliverables (zip, scoring json, PDFs, etc.)
     steps.append(run_step(
