@@ -18,10 +18,18 @@ import sys
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from config import DEFAULT_CONFIG, PipelineConfig
 
 
 def log(msg: str) -> None:
     print(f"[REPORT] {msg}", flush=True)
+
+
+def _clamp_score(val: float) -> float:
+    try:
+        return max(0.0, min(100.0, float(val)))
+    except Exception:
+        return 0.0
 
 
 # -----------------------------
@@ -41,11 +49,25 @@ def load_client_meta(job_dir: Path) -> Dict[str, Any]:
         return {}
 
 
+def load_jobs_manifest(job_dir: Path) -> List[Dict[str, Any]]:
+    path = job_dir / "jobs_manifest.json"
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception as exc:
+        log(f"Failed to parse jobs_manifest.json: {exc}")
+    return []
+
+
 # -----------------------------
 # Parse job_sources.txt
 # -----------------------------
 
-def parse_job_sources(job_dir: Path) -> Dict[str, Any]:
+def parse_job_sources(job_dir: Path, manifest: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     Parse job_sources.txt into:
       {
@@ -65,6 +87,22 @@ def parse_job_sources(job_dir: Path) -> Dict[str, Any]:
         ]
       }
     """
+    if manifest:
+        jobs = [
+            {
+                "index": int(item.get("index", idx + 1)),
+                "site": item.get("site", ""),
+                "score": float(item.get("raw_scraper_score", 0.0) or 0.0),
+                "url": item.get("url", ""),
+                "title": item.get("title", ""),
+                "company": item.get("company", ""),
+                "location": item.get("location", ""),
+                "salary": item.get("salary", ""),
+            }
+            for idx, item in enumerate(manifest)
+        ]
+        return {"high_fit_threshold": None, "high_fit_count": None, "jobs": jobs}
+
     src_path = job_dir / "job_sources.txt"
     if not src_path.exists():
         log("job_sources.txt not found; no jobs to report.")
@@ -175,7 +213,9 @@ def parse_job_sources(job_dir: Path) -> Dict[str, Any]:
 # Simple bucketing for match scores
 # -----------------------------
 
-def bucket_match_score(score: float, high_fit_threshold: Optional[float]) -> str:
+def bucket_match_score(
+    score: float, high_fit_threshold: Optional[float], config: PipelineConfig = DEFAULT_CONFIG
+) -> str:
     """
     Bucket the job_scraper score into human labels.
 
@@ -183,10 +223,10 @@ def bucket_match_score(score: float, high_fit_threshold: Optional[float]) -> str
     but it's still a useful "job match" signal.
     """
     if high_fit_threshold is None:
-        # Fallback heuristic
-        if score >= 3.0:
+        # Fallback heuristic based on pipeline config
+        if score >= config.min_score_for_high_fit:
             return "High"
-        elif score >= 1.5:
+        elif score >= config.min_score_for_high_fit - 10:
             return "Medium"
         elif score > 0:
             return "Low"
@@ -304,115 +344,111 @@ def build_markdown_report(
     client: Dict[str, Any],
     jobs_info: Dict[str, Any],
     selection: Optional[Dict[str, Any]] = None,
+    manifest: Optional[List[Dict[str, Any]]] = None,
+    config: PipelineConfig = DEFAULT_CONFIG,
 ) -> str:
-    jobs = sorted(jobs_info["jobs"], key=lambda j: j.get("score", 0.0), reverse=True)
-    high_fit_threshold = jobs_info.get("high_fit_threshold")
-    high_fit_count = jobs_info.get("high_fit_count")
-
-    # LLM selection summary (focus list)
     selection = selection or {}
-    selected_labels: List[str] = selection.get("selected_labels") or []
-    selected_labels_set = set(selected_labels)
-    jobs_by_index = {j["index"]: j for j in jobs}
+    manifest = manifest or []
 
-    llm_scores: Dict[int, float] = {}
+    manifest_by_index = {int(m.get("index", i + 1)): m for i, m in enumerate(manifest)}
+    manifest_by_id = {m.get("job_id") or f"job{m.get('index', i + 1):02d}": m for i, m in enumerate(manifest)}
+
     selection_jobs = selection.get("jobs") or []
-    for sj in selection_jobs:
-        label_str = sj.get("label")
-        ms = sj.get("match_score")
-        try:
-            idx = int(label_str)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(ms, (int, float)):
-            llm_scores[idx] = float(ms)
+    jobs: List[Dict[str, Any]] = []
 
-    # Build ordered focus rows (only the actually selected labels)
-    focus_rows: List[Dict[str, Any]] = []
-    for sj in selection_jobs:
-        label_str = sj.get("label")
-        if label_str not in selected_labels_set:
-            continue
+    if selection_jobs:
+        for sj in selection_jobs:
+            label = sj.get("label") or sj.get("job_id") or ""
+            try:
+                idx = int(str(label).lstrip("job"))
+            except (TypeError, ValueError):
+                idx = None
+            job_id = sj.get("job_id") or (f"job{idx:02d}" if idx else "")
+            meta = manifest_by_id.get(job_id) or (manifest_by_index.get(idx) if idx else {})
 
-        try:
-            idx = int(label_str)
-        except (TypeError, ValueError):
-            continue
+            norm_score = _clamp_score(sj.get("normalized_score", sj.get("raw_score", 0.0)))
+            bucket = sj.get("match_bucket") or bucket_match_score(norm_score, jobs_info.get("high_fit_threshold"), config)
 
-        job_info = jobs_by_index.get(idx)
-        if not job_info:
-            continue
+            jobs.append(
+                {
+                    "index": idx or len(jobs) + 1,
+                    "job_id": job_id or f"job{len(jobs) + 1:02d}",
+                    "title": sj.get("title") or meta.get("title", ""),
+                    "company": sj.get("company") or meta.get("company", ""),
+                    "location": sj.get("location") or meta.get("location", ""),
+                    "site": sj.get("source_site") or meta.get("site", ""),
+                    "url": sj.get("url") or meta.get("url", ""),
+                    "match_bucket": bucket,
+                    "normalized_score": norm_score,
+                    "salary": sj.get("salary_range") or meta.get("salary", ""),
+                }
+            )
+    else:
+        for j in jobs_info.get("jobs", []):
+            idx = j.get("index", len(jobs) + 1)
+            bucket = bucket_match_score(j.get("score", 0.0), jobs_info.get("high_fit_threshold"), config)
+            jobs.append(
+                {
+                    "index": idx,
+                    "job_id": f"job{int(idx):02d}",
+                    "title": j.get("title", ""),
+                    "company": j.get("company", ""),
+                    "location": j.get("location", ""),
+                    "site": j.get("site", ""),
+                    "url": j.get("url", ""),
+                    "match_bucket": bucket,
+                    "normalized_score": _clamp_score(j.get("score", 0.0)),
+                    "salary": j.get("salary", ""),
+                }
+            )
 
-        focus_rows.append(
-            {
-                "label": label_str,
-                "match_score": llm_scores.get(idx),
-                "job": job_info,
-            }
-        )
+    jobs = sorted(jobs, key=lambda j: j.get("normalized_score", 0.0), reverse=True)
 
-    salary_band = infer_salary_band(job_dir, selected_labels) if selected_labels else {}
+    focus_ids = selection.get("focus_shortlist") or []
+    focus_rows = [j for j in jobs if j.get("job_id") in focus_ids]
+    if not focus_rows:
+        focus_rows = jobs[: config.focus_shortlist_size]
 
-    client_name = client.get("client_name", "Client")
-    target_roles = client.get("target_roles") or []
-    preferred_titles = client.get("preferred_titles") or []
-    location_zip = client.get("location_zip", "")
-    remote_pref = client.get("remote_preference", "")
-    job_volume_target = client.get("job_volume_target", len(jobs))
-
-    title_str = ""
-    if target_roles:
-        title_str = ", ".join(target_roles)
-    elif preferred_titles:
-        title_str = ", ".join(preferred_titles)
+    selected_labels = [str(j.get("index")) for j in focus_rows]
+    salary_band = infer_salary_band(job_dir, selected_labels)
 
     lines: List[str] = []
-
-    # -----------------------------
-    # Header
-    # -----------------------------
-    lines.append(f"# Job Search Report for {client_name}")
+    lines.append("# Job Search Report for Client")
     lines.append("")
+
+    client_name = client.get("name") or client.get("client_name") or client.get("customer_name")
+    if client_name:
+        lines.append(f"### Prepared for: {client_name}")
+        lines.append("")
     lines.append(
-        "> This report doesn’t promise job offers — it gives you a realistic, data-backed "
-        "shortlist of roles where your skills are more likely to land interviews."
+        "A focused, AI-assisted job search packet built from your resume and intake data. "
+        "Use this report to see where your best-fit opportunities are and what to do next."
     )
-    lines.append("")
-
-    if title_str:
-        lines.append(f"**Target roles:** {title_str}")
-    if location_zip and remote_pref:
-        lines.append(f"**Location focus:** zip `{location_zip}` | remote preference: `{remote_pref}`")
-    elif location_zip:
-        lines.append(f"**Location focus:** zip `{location_zip}`")
-    elif remote_pref:
-        lines.append(f"**Location focus:** remote preference: `{remote_pref}`")
-    else:
-        lines.append("**Location focus:** (not specified; search used remote-friendly defaults)")
-    lines.append(f"**Requested job volume:** {job_volume_target}")
-    lines.append(f"**Jobs matched by scraper:** {len(jobs)}")
-    if high_fit_threshold is not None and high_fit_count is not None:
-        lines.append(f"**High-fit threshold:** score ≥ {high_fit_threshold}  → {high_fit_count} jobs")
     lines.append("")
     lines.append("---")
     lines.append("")
 
-    # -----------------------------
-    # Summary at a glance
-    # -----------------------------
     site_counts: Dict[str, int] = {}
     bucket_counts: Dict[str, int] = {"High": 0, "Medium": 0, "Low": 0, "Very Low": 0}
+    score_values: List[float] = []
 
     for j in jobs:
-        site_counts[j["site"]] = site_counts.get(j["site"], 0) + 1
-        b = bucket_match_score(j["score"], high_fit_threshold)
-        bucket_counts[b] = bucket_counts.get(b, 0) + 1
+        site = j.get("site") or "?"
+        site_counts[site] = site_counts.get(site, 0) + 1
+        bucket = j.get("match_bucket") or bucket_match_score(
+            j.get("normalized_score", 0.0), jobs_info.get("high_fit_threshold"), config
+        )
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        if isinstance(j.get("normalized_score"), (int, float)):
+            score_values.append(float(j["normalized_score"]))
 
     lines.append("## Summary at a Glance")
     lines.append("")
-    lines.append("These numbers show you **where your best bets are** so you can stop guessing and start focusing.")
-    lines.append("")
-    lines.append("**By match bucket (scraper score):**")
+    if score_values:
+        avg_score = sum(score_values) / len(score_values)
+        lines.append(f"Average match score across all roles: **{avg_score:.1f}** (0–100 scale)")
+        lines.append("")
+    lines.append("**By match bucket:**")
     for b in ["High", "Medium", "Low", "Very Low"]:
         count = bucket_counts.get(b, 0)
         lines.append(f"- {b}: {count} job(s)")
@@ -424,9 +460,6 @@ def build_markdown_report(
     lines.append("---")
     lines.append("")
 
-    # -----------------------------
-    # Focus shortlist (LLM-selected)
-    # -----------------------------
     if focus_rows:
         lines.append("## Focus Roles (AI-selected shortlist)")
         lines.append("")
@@ -435,25 +468,23 @@ def build_markdown_report(
             "If you only have time to apply to a handful of roles, **start here**."
         )
         lines.append("")
-        lines.append("| Job | Match score | Title | Company | Location | Where to apply |")
-        lines.append("|-----|-------------|-------|---------|----------|----------------|")
+        lines.append("| Job | Match score | Title | Company | Location | Where to apply | Salary signal |")
+        lines.append("|-----|-------------|-------|---------|----------|----------------|---------------|")
 
         match_values: List[float] = []
 
         for row in focus_rows:
-            label_str = row["label"]
-            ms = row.get("match_score")
-            job = row["job"]
+            label_str = str(row.get("index") or row.get("job_id") or "")
+            ms = row.get("normalized_score")
+            title = row.get("title") or "(no title)"
+            company = row.get("company") or "(no company)"
+            location = row.get("location") or "(unspecified)"
+            url = row.get("url") or ""
+            salary = row.get("salary") or "—"
 
-            title = job["title"] or "(no title)"
-            company = job["company"] or "(no company)"
-            location = job["location"] or "(unspecified)"
-            url = job.get("url") or ""
-
-            # Escape pipes for Markdown
-            title_md = title.replace("|", "\\|")
-            company_md = company.replace("|", "\\|")
-            location_md = location.replace("|", "\\|")
+            title_md = title.replace("|", "\|")
+            company_md = company.replace("|", "\|")
+            location_md = location.replace("|", "\|")
 
             if isinstance(ms, (int, float)):
                 match_values.append(float(ms))
@@ -461,54 +492,34 @@ def build_markdown_report(
             else:
                 ms_str = "—"
 
-            if url:
-                apply_md = f"[Open posting]({url})"
-            else:
-                apply_md = "Search title + company"
+            apply_md = f"[Open posting]({url})" if url else "Search title + company"
 
             lines.append(
-                f"| {int(label_str):02d} | {ms_str} | {title_md} | {company_md} | {location_md} | {apply_md} |"
+                f"| {label_str} | {ms_str} | {title_md} | {company_md} | {location_md} | {apply_md} | {salary} |"
             )
 
         lines.append("")
 
-        # -----------------------------
-        # Market compensation signal
-        # -----------------------------
         if salary_band:
             min_s = salary_band["min"]
             max_s = salary_band["max"]
             median_s = salary_band["median"]
-            sample_count = salary_band.get("sample_count", 0)
             posting_count = salary_band.get("posting_count", 0)
-
-            min_s_str = f"${min_s:,.0f}"
-            max_s_str = f"${max_s:,.0f}"
-            median_s_str = f"${median_s:,.0f}"
 
             lines.append("### Market Compensation Signal (Approximate)")
             lines.append("")
             lines.append(
                 f"Based on the focus roles that actually list explicit annual salary ranges "
                 f"(**{posting_count} of {len(focus_rows)}**), similar roles around your target area "
-                f"cluster roughly between **{min_s_str}** and **{max_s_str}** per year, with a central "
-                f"band near **{median_s_str}**."
+                f"cluster roughly between **${min_s:,.0f}** and **${max_s:,.0f}** per year, with a central "
+                f"band near **${median_s:,.0f}**."
             )
             lines.append("")
-            lines.append(
-                "For a profile like yours targeting these roles, that band is a realistic expectation "
-                "for market-aligned compensation. Offers far below this range should usually be treated "
-                "as starting points for negotiation, not your default target."
-            )
 
         if match_values:
             avg_match = sum(match_values) / len(match_values)
-            lines.append("")
             lines.append(
-                f"Your average AI match score across these focus roles is about **{avg_match:.1f}** "
-                "on a 0–100 scale. In plain language: these postings describe the kind of work your "
-                "current resume is already pointing at, so this band is a reasonable starting point "
-                "for your current market value in this lane."
+                f"Average AI match score for the focus list: **{avg_match:.1f}** (0–100)."
             )
 
         lines.append("")
@@ -520,9 +531,6 @@ def build_markdown_report(
         lines.append("---")
         lines.append("")
 
-    # -----------------------------
-    # What this report IS / IS NOT
-    # -----------------------------
     lines.append("## What This Report Is (and Isn’t)")
     lines.append("")
     lines.append("**This report IS:**")
@@ -540,9 +548,6 @@ def build_markdown_report(
     lines.append("---")
     lines.append("")
 
-    # -----------------------------
-    # Detailed table (all jobs)
-    # -----------------------------
     lines.append("## Job List (Best Matches First)")
     lines.append("")
     lines.append(
@@ -550,34 +555,30 @@ def build_markdown_report(
         "Use this to decide where to apply next once you've exhausted the focus shortlist above."
     )
     lines.append("")
-    lines.append("| # | Title | Company | Location | Site | Match bucket | Raw score |")
-    lines.append("|---|-------|---------|----------|------|--------------|-----------|")
+    lines.append("| # | Title | Company | Location | Site | Match bucket | Match score |")
+    lines.append("|---|-------|---------|----------|------|--------------|-------------|")
 
     for j in jobs:
         idx = j["index"]
-        title = j["title"] or "(no title)"
-        company = j["company"] or "(no company)"
-        location = j["location"] or "(unspecified)"
-        site = j["site"] or "?"
-        score = j["score"]
-        bucket = bucket_match_score(score, high_fit_threshold)
+        title = j.get("title") or "(no title)"
+        company = j.get("company") or "(no company)"
+        location = j.get("location") or "(unspecified)"
+        site = j.get("site") or "?"
+        score = j.get("normalized_score", 0.0)
+        bucket = j.get("match_bucket") or bucket_match_score(score, jobs_info.get("high_fit_threshold"), config)
 
-        # Escape pipes for Markdown
-        title_md = title.replace("|", "\\|")
-        company_md = company.replace("|", "\\|")
-        location_md = location.replace("|", "\\|")
+        title_md = title.replace("|", "\|")
+        company_md = company.replace("|", "\|")
+        location_md = location.replace("|", "\|")
 
         lines.append(
-            f"| {idx:02d} | {title_md} | {company_md} | {location_md} | {site} | {bucket} | {score:.2f} |"
+            f"| {int(idx):02d} | {title_md} | {company_md} | {location_md} | {site} | {bucket} | {score:.1f} |"
         )
 
     lines.append("")
     lines.append("---")
     lines.append("")
 
-    # -----------------------------
-    # Coaching / narrative
-    # -----------------------------
     lines.append("## How to Use This Report")
     lines.append("")
     lines.append("Think of this as your **attack plan**, not a wall of links.")
@@ -611,7 +612,6 @@ def build_markdown_report(
         "(automation, data, leadership, cloud, etc.) across the roles we pulled for you."
     )
     lines.append("")
-    # This PNG is created by career_insights.py as 'career_insights_skills_pie.png'
     lines.append("![Skill demand across job list](career_insights_skills_pie.png)")
     lines.append("")
     lines.append(
@@ -641,7 +641,8 @@ def main() -> None:
     log(f"Building report for job folder: {job_dir}")
 
     client_meta = load_client_meta(job_dir)
-    jobs_info = parse_job_sources(job_dir)
+    manifest = load_jobs_manifest(job_dir)
+    jobs_info = parse_job_sources(job_dir, manifest if manifest else None)
 
     if not jobs_info["jobs"]:
         log("No jobs found in job_sources.txt; aborting report creation.")
@@ -649,7 +650,9 @@ def main() -> None:
 
     selection = load_selection_summary(job_dir)
 
-    report_md = build_markdown_report(job_dir, client_meta, jobs_info, selection)
+    report_md = build_markdown_report(
+        job_dir, client_meta, jobs_info, selection, manifest, DEFAULT_CONFIG
+    )
     out_path = job_dir / "final_report.md"
     out_path.write_text(report_md, encoding="utf-8")
 

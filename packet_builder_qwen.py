@@ -23,8 +23,10 @@ import os
 import sys
 import glob
 import textwrap
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 from resume_loader import load_base_resume as _load_base_resume
+from datetime import datetime
+from config import DEFAULT_CONFIG, PipelineConfig
 
 import requests
 import re
@@ -841,6 +843,152 @@ def compute_match_score(
     score = max(0.0, min(100.0, round(score, 1)))
     return score
 
+def _clamp_score(val: float) -> float:
+    try:
+        return max(0.0, min(100.0, float(val)))
+    except Exception:
+        return 0.0
+
+
+def _load_manifest(job_dir: Path) -> List[Dict[str, Any]]:
+    path = Path(job_dir) / "jobs_manifest.json"
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        return []
+    return []
+
+
+def _parse_job_description_header(desc_path: Path) -> Dict[str, str]:
+    """Read the top of job_description_XX.txt to recover metadata."""
+    info: Dict[str, str] = {}
+    try:
+        lines = desc_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return info
+
+    for line in lines[:10]:
+        if ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        info[label.strip().lower()] = value.strip()
+    return info
+
+
+def _fallback_manifest(job_dir: Path) -> List[Dict[str, Any]]:
+    manifest: List[Dict[str, Any]] = []
+    for desc_path in sorted(Path(job_dir).glob("job_description_*.txt")):
+        name = desc_path.stem
+        try:
+            idx = int(name.split("_")[-1])
+        except (TypeError, ValueError):
+            continue
+        header = _parse_job_description_header(desc_path)
+        manifest.append(
+            {
+                "job_id": f"job{idx:02d}",
+                "index": idx,
+                "title": header.get("title", ""),
+                "company": header.get("company", ""),
+                "location": header.get("location", ""),
+                "site": header.get("site", ""),
+                "url": header.get("source url", ""),
+                "salary": header.get("salary", ""),
+                "raw_scraper_score": 0.0,
+                "snippet": "",
+            }
+        )
+    return manifest
+
+
+def _bucket_match_score(score: float, config: PipelineConfig) -> str:
+    if score >= config.min_score_for_high_fit:
+        return "High"
+    if score >= config.min_score_for_high_fit - 10:
+        return "Medium"
+    if score >= config.min_score_for_high_fit - 25:
+        return "Low"
+    return "Very Low"
+
+
+def write_selection_summary(job_dir: Path, config: PipelineConfig = DEFAULT_CONFIG) -> None:
+    manifest = _load_manifest(job_dir) or _fallback_manifest(job_dir)
+    if not manifest:
+        print("[BUILDER]   -> No manifest found; skipping selection_summary.json", flush=True)
+        return
+
+    summary_jobs: List[Dict[str, Any]] = []
+
+    for entry in manifest:
+        job_id = entry.get("job_id") or f"job{entry.get('index', 0):02d}"
+        label_num = int(str(entry.get("index") or "0") or 0)
+        score_path = job_dir / f"score_job{label_num:02d}.json"
+
+        raw_score = 0.0
+        if score_path.exists():
+            try:
+                with score_path.open("r", encoding="utf-8") as f:
+                    score_payload = json.load(f)
+                raw_score = float(score_payload.get("match_score") or 0.0)
+            except Exception:
+                raw_score = 0.0
+
+        normalized = _clamp_score(raw_score)
+        bucket = _bucket_match_score(normalized, config)
+
+        summary_jobs.append(
+            {
+                "job_id": job_id,
+                "label": f"{label_num:02d}",
+                "title": entry.get("title", ""),
+                "company": entry.get("company", ""),
+                "location": entry.get("location", ""),
+                "source_site": entry.get("site", ""),
+                "url": entry.get("url", ""),
+                "salary_range": entry.get("salary", ""),
+                "raw_score": raw_score,
+                "normalized_score": normalized,
+                "match_bucket": bucket,
+            }
+        )
+
+    bucket_priority = {"High": 3, "Medium": 2, "Low": 1, "Very Low": 0}
+    summary_jobs = sorted(
+        summary_jobs,
+        key=lambda j: (
+            bucket_priority.get(j.get("match_bucket", "Very Low"), 0),
+            1 if j.get("salary_range") else 0,
+            j.get("normalized_score", 0.0),
+        ),
+        reverse=True,
+    )
+
+    focus_shortlist = summary_jobs[: config.focus_shortlist_size]
+
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "focus_shortlist": [j.get("job_id") for j in focus_shortlist],
+        "jobs": summary_jobs,
+    }
+
+    out_path = job_dir / "selection_summary.json"
+    try:
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(
+            f"[BUILDER]   -> selection_summary.json written ({len(summary_jobs)} jobs, "
+            f"shortlist size {len(focus_shortlist)})",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[BUILDER]   -> Failed to write selection_summary.json: {exc}", flush=True)
+
+
 def process_job(job_dir: str) -> None:
     # High-level job banner
     print("\n====================================================", flush=True)
@@ -1078,6 +1226,8 @@ def process_job(job_dir: str) -> None:
             f"OpenAI polish={'yes' if (resume_polished or cover_polished) else 'no'}",
             flush=True,
         )
+
+    write_selection_summary(Path(job_dir), config=DEFAULT_CONFIG)
 
 
 def main():
