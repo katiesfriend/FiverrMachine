@@ -40,7 +40,9 @@ from engines.ai_model import run_ai
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from resume_loader import load_base_resume, ResumeError
+from config import load_config, PipelineConfig
 
+CONFIG: PipelineConfig = load_config()
 TOP_N_JOBS_DEFAULT = 20  # how many jobs to turn into job_description_XX.txt
 MAX_FETCH_MULTIPLIER = 2  # how many jobs to fetch full descriptions for, relative to TOP_N
 PRIMARY_FIT_THRESHOLD = 2.5  # heuristic score cutoff for "high fit"
@@ -1100,7 +1102,8 @@ def fetch_full_descriptions(browser, jobs: List[Dict[str, Any]]) -> None:
 
 def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None:
     """
-    Write job_description_XX.txt and job_sources.txt.
+    Write job_description_XX.txt, job_sources.txt, and a JSON manifest.
+
     top_n controls how many job_description_XX.txt files we emit.
     Uses a primary/secondary split so high-fit jobs are preferred.
     """
@@ -1130,14 +1133,21 @@ def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None
     # In tiny markets, we may still have fewer than top_n total jobs.
     selected = selected[:len(selected)]
 
+    manifest: List[Dict[str, Any]] = []
+
     # Write descriptions
     for i, job in enumerate(selected, start=1):
+        job_id = f"job{i:02d}"
         fname = job_dir / f"job_description_{i:02d}.txt"
+        salary = job.get("salary") or job.get("compensation") or ""
+        salary_line = salary if salary else "Not listed"
         content_lines = [
+            f"Job ID: {job_id}",
             f"Title: {job.get('title', '')}",
             f"Company: {job.get('company', '')}",
             f"Location: {job.get('location', '')}",
             f"Site: {job.get('site', '')}",
+            f"Salary: {salary_line}",
             f"Source URL: {job.get('url', '')}",
             "",
             "Job Summary:",
@@ -1153,6 +1163,21 @@ def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None
         except Exception as e:
             log(f"ERROR writing {fname}: {e}")
 
+        manifest.append(
+            {
+                "job_id": job_id,
+                "index": i,
+                "title": job.get("title", ""),
+                "company": job.get("company", ""),
+                "location": job.get("location", ""),
+                "site": job.get("site", ""),
+                "url": job.get("url", ""),
+                "salary": salary,
+                "raw_scraper_score": job.get("score", 0.0),
+                "snippet": job.get("snippet", ""),
+            }
+        )
+
     # Write job_sources.txt
     src_path = job_dir / "job_sources.txt"
     try:
@@ -1165,6 +1190,8 @@ def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None
                 f"(high-fit >= {PRIMARY_FIT_THRESHOLD}: {high_fit_count})\n\n"
             )
             for i, job in enumerate(selected, start=1):
+                salary = job.get("salary") or job.get("compensation") or ""
+                salary_str = salary if salary else "(no salary listed)"
                 f.write(
                     f"{i:02d}. [{job.get('site','')}] "
                     f"score={job.get('score', 0.0):.2f} "
@@ -1173,48 +1200,91 @@ def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None
                 f.write(
                     f"    title={job.get('title','')}\n"
                     f"    company={job.get('company','')}\n"
-                    f"    location={job.get('location','')}\n\n"
+                    f"    location={job.get('location','')}\n"
+                    f"    salary={salary_str}\n\n"
                 )
     except Exception as e:
         log(f"ERROR writing {src_path}: {e}")
 
-    log(f"Wrote {len(selected)} job_description_XX.txt files and job_sources.txt")
+    manifest_path = job_dir / "jobs_manifest.json"
+    try:
+        with manifest_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+    except Exception as e:
+        log(f"ERROR writing {manifest_path}: {e}")
+
+    log(
+        f"Wrote {len(selected)} job_description_XX.txt files, job_sources.txt, "
+        "and jobs_manifest.json"
+    )
 
 def scrape_job_boards(job_dir: Path) -> None:
     meta = load_client_meta(job_dir)
     query, location, skills = build_search_query(meta)
 
+    cfg = CONFIG
+
     # Determine how many jobs we want to *deliver* and how many we are willing to *scrape*
-    job_volume_target = int(meta.get("job_volume_target", TOP_N_JOBS_DEFAULT) or TOP_N_JOBS_DEFAULT)
+    job_volume_target = int(meta.get("job_volume_target", cfg.max_jobs_total) or cfg.max_jobs_total)
     if job_volume_target <= 0:
-        job_volume_target = TOP_N_JOBS_DEFAULT
+        job_volume_target = cfg.max_jobs_total
 
     max_jobs_to_scrape = int(meta.get("max_jobs_to_scrape", job_volume_target * 10) or (job_volume_target * 10))
     if max_jobs_to_scrape < job_volume_target:
         max_jobs_to_scrape = job_volume_target
 
-    top_n = job_volume_target
+    top_n = min(job_volume_target, cfg.max_jobs_total)
+    max_jobs_to_scrape = min(max_jobs_to_scrape, cfg.max_jobs_total * 2)
 
     log(f"Job dir: {job_dir}")
     log(f"Search query: '{query}'  | location: '{location}'")
     log(f"Skills: {skills}")
-    log(f"Target job volume: {top_n}, max jobs to scrape: {max_jobs_to_scrape}")
+    log(
+        f"Target job volume: {top_n}, max jobs to scrape: {max_jobs_to_scrape}, "
+        f"per-site cap: {cfg.max_jobs_per_site}"
+    )
 
     all_jobs: List[Dict[str, Any]] = []
+    per_site_counts: Dict[str, int] = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
         try:
-            # Each function returns a list of scored jobs
-            all_jobs.extend(scrape_indeed(browser, query, location, skills, title_hint=query))
-            all_jobs.extend(scrape_linkedin(browser, query, location, skills, title_hint=query))
-            all_jobs.extend(scrape_ziprecruiter(browser, query, location, skills, title_hint=query))
-            all_jobs.extend(scrape_glassdoor(browser, query, location, skills, title_hint=query))
-            all_jobs.extend(scrape_usajobs(browser, query, location, skills, title_hint=query))
-            all_jobs.extend(scrape_monster(browser, query, location, skills, title_hint=query))
+            engines: List[Tuple[str, Any]] = [
+                ("indeed", scrape_indeed),
+                ("linkedin", scrape_linkedin),
+                ("ziprecruiter", scrape_ziprecruiter),
+                ("glassdoor", scrape_glassdoor),
+                ("usajobs", scrape_usajobs),
+                ("monster", scrape_monster),
+            ]
+
+            for site_name, func in engines:
+                if len(all_jobs) >= cfg.max_jobs_total:
+                    log(
+                        f"Reached global max_jobs_total ({cfg.max_jobs_total}); "
+                        "skipping remaining engines."
+                    )
+                    break
+
+                jobs = func(browser, query, location, skills, title_hint=query)
+                per_site_counts[site_name] = len(jobs)
+
+                if cfg.max_jobs_per_site > 0:
+                    jobs = sorted(jobs, key=lambda j: j.get("score", 0.0), reverse=True)[
+                        : cfg.max_jobs_per_site
+                    ]
+
+                all_jobs.extend(jobs)
+                log(
+                    f"{site_name}: kept {len(jobs)} (raw {per_site_counts[site_name]}). "
+                    f"Running total: {len(all_jobs)}"
+                )
 
             log(f"Total collected scored jobs across all boards: {len(all_jobs)}")
+            for site, count in per_site_counts.items():
+                log(f"  - {site}: {count} fetched")
 
             if not all_jobs:
                 log("No scored jobs found. Writing a single fallback job_description_01.txt")
@@ -1230,7 +1300,7 @@ def scrape_job_boards(job_dir: Path) -> None:
             all_jobs_sorted = sorted(all_jobs, key=lambda j: j["score"], reverse=True)
 
             max_fetch = max(top_n * MAX_FETCH_MULTIPLIER, top_n)
-            max_fetch = min(len(all_jobs_sorted), max_fetch, max_jobs_to_scrape)
+            max_fetch = min(len(all_jobs_sorted), max_fetch, max_jobs_to_scrape, cfg.max_jobs_total)
 
             to_fetch = all_jobs_sorted[:max_fetch]
 
