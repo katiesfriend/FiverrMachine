@@ -241,17 +241,6 @@ def infer_meta_from_resume(job_dir: Path) -> Dict[str, Any]:
 def log(msg: str) -> None:
     print(f"[SCRAPER] {msg}", flush=True)
 
-DEBUG_SCRAPER = True  # flip to False to quiet debug logs later
-
-def debug(msg: str) -> None:
-    """
-    Lightweight debug logger for the scraper.
-    Controlled by the DEBUG_SCRAPER flag so we can turn this on/off
-    without touching call sites.
-    """
-    if DEBUG_SCRAPER:
-        log(f"[SCRAPER-DEBUG] {msg}")
-
 def infer_meta_from_resume_ai(job_dir: Path) -> Dict[str, Any]:
     """
     Use an LLM to read base_resume.txt and infer:
@@ -527,55 +516,62 @@ def normalize_skills(meta: Dict[str, Any]) -> List[str]:
 
     return [s.lower() for s in skills]
 
+
 def extract_title_and_location(meta: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Decide on search title and location based on metadata from client_request
-    and/or inferred resume meta.
+    Determine search title and location from metadata.
+
+    Title priority:
+      1. target_roles[0]
+      2. preferred_titles[0]
+      3. target_title / headline / job_title
+
+    Location priority:
+      - If remote_preference == "remote_only" -> "Remote"
+      - If remote_preference == "remote_plus_local" -> zip if present, else "Remote"
+      - Else: zip if present, else `location`, else "Remote"
     """
-    # Title selection
-    title = (
-        meta.get("search_title")
-        or meta.get("target_title")
-        or meta.get("role")
-        or ""
-    )
-    if not title:
-        guessed_roles = meta.get("target_roles") or []
-        if guessed_roles:
-            title = guessed_roles[0]
-        else:
-            # Absolute last-ditch; better than crashing
-            title = "Desktop Support Technician"
+    target_roles = meta.get("target_roles") or []
+    preferred_titles = meta.get("preferred_titles") or []
 
-    # Location hints from intake / inferred meta
-    location_fallback = (
-        meta.get("location")
-        or meta.get("city_state")
-        or meta.get("city")
-        or meta.get("region")
-        or ""
-    )
-    zip_code = (meta.get("zip") or meta.get("postal_code") or "").strip()
-    remote_pref = (meta.get("remote_preference") or "local_only").strip().lower()
+    # Normalize lists
+    if isinstance(target_roles, str):
+        target_roles = [s.strip() for s in target_roles.split(",") if s.strip()]
+    if isinstance(preferred_titles, str):
+        preferred_titles = [s.strip() for s in preferred_titles.split(",") if s.strip()]
 
-    # If they explicitly want remote only, don't force any geo constraint
-    if remote_pref == "remote_only":
-        return title, "Remote"
-
-    # Mixed or local-only: prefer concrete geo first
-    if zip_code:
-        # Most precise: zip-based search
-        location = zip_code
-    elif location_fallback and location_fallback.strip().lower() not in {
-        "united states",
-        "usa",
-        "us",
-    }:
-        # Use a specific city/state fallback, but never the whole US as a "location"
-        location = location_fallback.strip()
+    title = ""
+    if isinstance(target_roles, list) and target_roles:
+        title = target_roles[0]
+    elif isinstance(preferred_titles, list) and preferred_titles:
+        title = preferred_titles[0]
     else:
-        # No good local signal; treat as effectively remote-focused
+        title = (
+            meta.get("target_title")
+            or meta.get("headline")
+            or meta.get("job_title")
+            or ""
+        )
+
+    title = str(title).strip()
+
+    remote_pref = str(meta.get("remote_preference") or "").lower()
+    zip_code = str(meta.get("location_zip") or "").strip()
+    location_fallback = str(meta.get("location") or "").strip()
+
+    if remote_pref == "remote_only":
         location = "Remote"
+    elif remote_pref == "remote_plus_local":
+        # Prefer local zip, but remote is acceptable
+        location = zip_code or "Remote"
+    else:
+        # Local-only or unspecified
+        if zip_code:
+            location = zip_code
+        elif location_fallback:
+            location = location_fallback
+        else:
+            location = "United States"
 
     return title, location
 

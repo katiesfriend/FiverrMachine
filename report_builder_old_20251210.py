@@ -602,24 +602,6 @@ def build_markdown_report(
         "and the job descriptions. They’re meant to **guide your focus**, not decide your fate."
     )
     lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## Skill Demand Snapshot (across your job list)")
-    lines.append("")
-    lines.append(
-        "The chart below shows how often the job descriptions mention key skill clusters "
-        "(automation, data, leadership, cloud, etc.) across the roles we pulled for you."
-    )
-    lines.append("")
-    # This PNG is created by career_insights.py as 'career_insights_skills_pie.png'
-    lines.append("![Skill demand across job list](career_insights_skills_pie.png)")
-    lines.append("")
-    lines.append(
-        "_Tip: if one slice is much smaller than the others (for example, **Automation & "
-        "Scripting**), that’s a clear signal about where to invest learning time to unlock more "
-        "opportunities over the next few months._"
-    )
-    lines.append("")
 
     return "\n".join(lines)
 

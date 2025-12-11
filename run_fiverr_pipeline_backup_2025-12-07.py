@@ -72,43 +72,30 @@ def main():
         [str(VENV_PY), str(BASE / "packet_builder_qwen.py"), str(processing_job_dir)]
     ))
 
-    # 3) Build the Job Search Report (client-facing summary letter)
-    steps.append(run_step(
-        "report_builder",
-        [str(VENV_PY), str(BASE / "report_builder.py"), str(processing_job_dir)]
-    ))
-
-    # 4) Generate PDFs (resume + cover letters) inside the job folder
+    # 3) Generate PDFs (resume + cover letters) inside the job folder
     steps.append(run_step(
         "generate_pdfs",
         [str(VENV_PY), str(BASE / "generate_pdfs.py"), job_folder_name]
     ))
-
-    # 4b) Generate LaTeX PDF for the Job Search Report
-    steps.append(run_step(
-        "report_latex",
-        [str(VENV_PY), str(BASE / "latex_report_builder.py"), str(processing_job_dir)]
-    ))
-
-    # 4c) Generate LaTeX-styled cover letters
+    
+    # 3b) Generate LaTeX-styled cover letters
     steps.append(run_step(
         "cover_letter_latex",
         [str(VENV_PY), str(BASE / "cover_letter_latex.py"), str(processing_job_dir)]
     ))
 
-    # 5) Package deliverables (zip, scoring json, PDFs, etc.)
+    # 4) Package deliverables (zip, scoring json, PDFs, etc.)
     steps.append(run_step(
         "deliverable_packager",
         [str(VENV_PY), str(BASE / "deliverable_packager.py"), str(processing_job_dir)]
     ))
-
-    # 6) Career Insights letter
+    # 5) Career Insights Letter
     steps.append(run_step(
         "career_insights",
         [str(VENV_PY), str(BASE / "career_insights.py"), str(processing_job_dir)]
     ))
 
-    # (Optional, later) Upload to Google Drive, notify phone
+    # (Optional, later) 4) Upload to Google Drive, notify phone
     # steps.append(run_step(
     #     "google_drive_uploader",
     #     [str(VENV_PY), str(BASE / "google_drive_uploader.py"), str(processing_job_dir)]
@@ -116,16 +103,11 @@ def main():
 
     ok = all(s["ok"] for s in steps)
 
-    report_md_path = processing_job_dir / "final_report.md"
-    report_pdf_path = processing_job_dir / "final_report.pdf"
-
     print(json.dumps({
         "ok": ok,
         "job_folder": job_folder_name,
         "processing_dir": str(processing_job_dir),
         "deliverables_dir": str(DELIVERABLES),
-        "report_file": str(report_md_path) if report_md_path.exists() else None,
-        "report_pdf": str(report_pdf_path) if report_pdf_path.exists() else None,
         "steps": steps,
     }))
 

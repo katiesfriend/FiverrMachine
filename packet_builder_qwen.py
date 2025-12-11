@@ -29,6 +29,72 @@ from resume_loader import load_base_resume as _load_base_resume
 import requests
 import re
 from collections import Counter
+from pathlib import Path
+
+def build_intake_hint_for_prompt(client_request: dict) -> str:
+    """
+    Turn the client_request JSON for a Fiverr job into a plain text block
+    that can be appended to the job description to give the model more
+    context. This is defensive and works even if the JSON schema changes.
+    """
+    if not isinstance(client_request, dict):
+        return ""
+
+    meta = client_request.get("meta") or {}
+    source = meta.get("source")
+
+    lines: list[str] = []
+    lines.append("FIVERR CLIENT INTAKE DATA")
+    lines.append("This job came from a Fiverr order. The following fields")
+    lines.append("summarize what the client filled out in the intake form.")
+    lines.append("")
+
+    if source:
+        lines.append(f"source: {source}")
+        lines.append("")
+
+    # High level fields we expect to have in the intake
+    interesting_keys = [
+        "job_search_goal",
+        "target_title",
+        "target_industry",
+        "role_focus",
+        "salary_target",
+        "location_preferences",
+        "remote_preferences",
+        "commute_limit",
+        "must_have_skills",
+        "nice_to_have_skills",
+        "tools_and_tech",
+        "certifications",
+        "experiences_to_highlight",
+        "achievements_to_highlight",
+        "company_preferences",
+        "job_search_constraints",
+        "tone_preferences",
+        "notes_for_writer",
+    ]
+
+    for key in interesting_keys:
+        value = client_request.get(key)
+        if value:
+            label = key.replace("_", " ").title()
+            lines.append(f"{label}:")
+            lines.append(str(value))
+            lines.append("")
+
+    # Shallow dump of any extra user level fields
+    skip_keys = set(interesting_keys + ["meta"])
+    extra_keys = sorted(k for k in client_request.keys() if k not in skip_keys)
+
+    if extra_keys:
+        lines.append("Additional intake fields:")
+        for key in extra_keys:
+            value = client_request.get(key)
+            if value:
+                lines.append(f"{key}: {value}")
+
+    return "\n".join(lines).strip()
 
 
 # -----------------------------
@@ -785,8 +851,43 @@ def process_job(job_dir: str) -> None:
     print("[BUILDER]   [1/3] Loading base_resume...", flush=True)
     base_resume = load_base_resume(job_dir)
 
-    print("[BUILDER]   [2/3] Loading client_request.json (if present)...", flush=True)
-    client_meta = load_client_meta(job_dir)
+    # Step 2: load optional client_request.json for Fiverr jobs only
+    print("[BUILDER]   [2/3] Loading client_request.json (if present)...")
+
+    client_request = None
+    client_request_path = Path(os.path.join(job_dir, "client_request.json"))
+
+    if client_request_path.is_file():
+        try:
+            with client_request_path.open("r", encoding="utf-8") as f:
+                raw_request = json.load(f)
+        except Exception as exc:
+            print(f"[BUILDER]   [WARN] Could not parse client_request.json: {exc}")
+            raw_request = None
+
+        if isinstance(raw_request, dict):
+            meta = raw_request.get("meta") or {}
+            source = meta.get("source")
+            if source == "fiverr":
+                client_request = raw_request
+                print("[BUILDER]   [FIVERR] Using intake from client_request.json (source is fiverr).")
+            else:
+                print("[BUILDER]   [FIVERR] client_request.json present but meta.source is not 'fiverr'. Ignoring intake for this job.")
+        else:
+            print("[BUILDER]   [WARN] client_request.json did not contain a JSON object. Ignoring intake.")
+    else:
+        print("[BUILDER]   [FIVERR] No client_request.json found. Proceeding without intake data.")
+
+    # Build a lightweight meta object for downstream model calls.
+    # For Fiverr jobs this includes the intake; for all others it is None.
+    if client_request is not None:
+        client_meta = {
+            "source": "fiverr",
+            "intake": client_request.get("intake") or {},
+            "raw": client_request,
+        }
+    else:
+        client_meta = None
 
     print("[BUILDER]   [3/3] Loading job_description_*.txt files...", flush=True)
     jd_files = load_job_descriptions(job_dir)
@@ -803,6 +904,8 @@ def process_job(job_dir: str) -> None:
 
     # Stage 2: per-job generation
     total = len(jd_files)
+    # Stage 2: per-job generation
+    total = len(jd_files)
     for idx, jd_path in enumerate(jd_files, start=1):
         job_label = f"{idx:02d}"
         print(
@@ -813,8 +916,56 @@ def process_job(job_dir: str) -> None:
         with open(jd_path, "r", encoding="utf-8", errors="ignore") as f:
             jd_text = f.read().strip()
 
+        # -------------------------------------------------
+        # If this job came from Fiverr and we have intake
+        # data, append a compact intake summary to the
+        # job description that goes to the model.
+        # -------------------------------------------------
+        jd_for_model = jd_text
+
+        if client_meta and isinstance(client_meta, dict):
+            # Prefer a nested "intake" object if present.
+            raw_intake = client_meta.get("intake")
+            if isinstance(raw_intake, dict):
+                intake = raw_intake
+            else:
+                intake = client_meta
+
+            summary_lines = []
+
+            def add_line(label: str, key: str) -> None:
+                value = intake.get(key)
+                if value:
+                    # Handle lists vs strings
+                    if isinstance(value, list):
+                        value_str = ", ".join(str(v) for v in value if str(v).strip())
+                    else:
+                        value_str = str(value).strip()
+                    if value_str:
+                        summary_lines.append(f"{label}: {value_str}")
+
+            # These keys match the intake JSON we are designing.
+            add_line("Target role", "target_role")
+            add_line("Target seniority", "target_seniority")
+            add_line("Target industries", "target_industries")
+            add_line("Preferred locations", "preferred_locations")
+            add_line("Remote preference", "remote_preference")
+            add_line("Minimum salary (USD)", "salary_min_usd")
+            add_line("Work schedule constraints", "schedule_constraints")
+            add_line("Must have technologies", "must_have_tech")
+            add_line("Nice to have technologies", "nice_to_have_tech")
+            add_line("Deal breakers", "deal_breakers")
+            add_line("Notes to writer", "notes_to_writer")
+
+            if summary_lines:
+                intake_block = (
+                    "=== CLIENT INTAKE SUMMARY (FIVERR) ===\n"
+                    + "\n".join(summary_lines)
+                )
+                jd_for_model = jd_text + "\n\n" + intake_block
+
         print(f"[BUILDER]   -> Calling Qwen draft for job {job_label}...", flush=True)
-        draft = call_qwen_draft(base_resume, jd_text, client_meta)
+        draft = call_qwen_draft(base_resume, jd_for_model, client_meta)
 
         resume_text = draft["resume"]
         cover_text = draft["cover_letter"]

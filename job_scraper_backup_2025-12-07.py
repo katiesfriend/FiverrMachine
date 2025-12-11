@@ -34,12 +34,9 @@ import traceback
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 from urllib.parse import quote_plus
-import re
-from resume_loader import load_base_resume
-from engines.ai_model import run_ai
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from resume_loader import load_base_resume, ResumeError
+
 
 TOP_N_JOBS_DEFAULT = 20  # how many jobs to turn into job_description_XX.txt
 MAX_FETCH_MULTIPLIER = 2  # how many jobs to fetch full descriptions for, relative to TOP_N
@@ -53,448 +50,71 @@ except Exception:  # soft-fail if tools not available
     class ResumeError(Exception):
         pass
 
-def infer_title_from_skills(skills: List[str]) -> str:
-    """
-    Very simple, deterministic mapping from skill clusters to a reasonable job title.
-    We only use this when the client hasn't explicitly given a title.
-    """
-    if not skills:
-        return ""
-
-    all_s = " ".join(s.lower() for s in skills)
-
-    def has(*words: str) -> bool:
-        return any(w in all_s for w in words)
-
-    # --- IT support / desktop support cluster (James's case)
-    if has(
-        "sccm",
-        "service now",
-        "servicenow",
-        "help desk",
-        "service desk",
-        "desktop support",
-        "windows 7",
-        "windows 10",
-        "windows 11",
-        "active directory",
-        "citrix",
-        "pos",
-        "endpoint",
-    ):
-        return "IT Support Specialist"
-
-    # --- Project / program management cluster
-    if has(
-        "project plan",
-        "project management",
-        "pmp",
-        "gantt",
-        "stakeholder",
-        "scrum",
-        "kanban",
-        "jira",
-        "confluence",
-    ):
-        return "Project Manager"
-
-    # --- Data / analytics cluster
-    if has(
-        "sql",
-        "tableau",
-        "power bi",
-        "excel",
-        "data analysis",
-        "analytics",
-        "lookerstudio",
-    ):
-        return "Data Analyst"
-
-    # --- Backend / general software engineer cluster
-    if has(
-        "python",
-        "java",
-        "c#",
-        "c++",
-        "golang",
-        "node.js",
-        "django",
-        "flask",
-        "spring",
-        "rest api",
-    ):
-        return "Software Engineer"
-
-    # --- Web / frontend developer cluster
-    if has(
-        "javascript",
-        "react",
-        "vue",
-        "angular",
-        "html",
-        "css",
-        "next.js",
-        "frontend",
-        "front end",
-    ):
-        return "Frontend Developer"
-
-    # --- Cloud / DevOps / SRE cluster
-    if has(
-        "aws",
-        "azure",
-        "gcp",
-        "kubernetes",
-        "docker",
-        "terraform",
-        "ansible",
-        "ci/cd",
-        "jenkins",
-        "github actions",
-    ):
-        return "Cloud / DevOps Engineer"
-
-    # If nothing obvious, leave it blank so we can fall back to skills-only search
-    return ""
 
 def infer_meta_from_resume(job_dir: Path) -> Dict[str, Any]:
     """
-    Fallback: infer skills from the resume, then derive a reasonable job title
-    FROM those skills.
-
-    Rules:
-      - If client_request.json already gave a title, we DO NOT override it
-        (that logic lives in load_client_meta).
-      - We always try to populate `skills` from the resume.
-      - We derive `target_roles[0]` from `skills` using infer_title_from_skills().
-      - If we can't confidently guess a title, we return skills only and let
-        the search run purely by skills.
+    Fallback: infer a rough target title + skills from the resume text
+    when client_request.json is missing or mostly empty.
     """
-    try:
-        text = load_base_resume(job_dir)
-    except Exception as exc:
-        log(f"[SCRAPER] Could not load resume for inference: {exc}")
+    if load_base_resume is None:
+        log("[SCRAPER] resume_loader not available; cannot infer from resume.")
         return {}
 
-    if not text or not text.strip():
+    try:
+        text = load_base_resume(job_dir)
+    except ResumeError as exc:
+        log(f"[SCRAPER] Could not load resume for inference: {exc}")
         return {}
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # --- Extract skills from a "Skills" section
-    skills: List[str] = []
-    section_stop = {
-        "summary", "professional summary", "experience", "work experience",
-        "employment history", "education", "projects", "certifications",
-        "profile", "objective",
-    }
-
-    for idx, ln in enumerate(lines):
-        low = ln.lower()
-        if "skill" in low:
-            # Look at the next few lines for bullets / comma-separated skills
-            for j in range(idx + 1, min(idx + 10, len(lines))):
-                seg = lines[j].strip()
-                if not seg:
-                    continue
-                seg_low = seg.lower()
-                # Stop if we hit the next major section
-                if any(stop in seg_low for stop in section_stop):
-                    break
-                parts = re.split(r"[•\u2022,;\-|·]", seg)
-                for p in parts:
-                    p = p.strip(" •\u2022-–·")
-                    if len(p) >= 2:
-                        skills.append(p)
-            break
-
-    # De-duplicate and normalize skills
-    seen = set()
-    norm_skills: List[str] = []
-    for s in skills:
-        key = s.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        norm_skills.append(s)
-        if len(norm_skills) >= 30:
-            break
-
-    inferred: Dict[str, Any] = {}
-
-    # Always populate skills if we found any
-    if norm_skills:
-        inferred["skills"] = norm_skills
-
-    # Derive job title purely from skills (not from the name/header line)
-    title_from_skills = infer_title_from_skills(norm_skills)
-    if title_from_skills:
-        inferred["target_roles"] = [title_from_skills]
-
-    log(f"[SCRAPER] Inferred from resume: {inferred}")
-    return inferred
-
-# -----------------------------
-# Utility functions
-# -----------------------------
-
-def log(msg: str) -> None:
-    print(f"[SCRAPER] {msg}", flush=True)
-
-DEBUG_SCRAPER = True  # flip to False to quiet debug logs later
-
-def debug(msg: str) -> None:
-    """
-    Lightweight debug logger for the scraper.
-    Controlled by the DEBUG_SCRAPER flag so we can turn this on/off
-    without touching call sites.
-    """
-    if DEBUG_SCRAPER:
-        log(f"[SCRAPER-DEBUG] {msg}")
-
-def infer_meta_from_resume_ai(job_dir: Path) -> Dict[str, Any]:
-    """
-    Use an LLM to read base_resume.txt and infer:
-      - a target job title (if clearly indicated)
-      - core skills to drive job search
-
-    This only runs when the Fiverr intake did NOT specify a job title.
-    """
-    # Ensure we can load the resume text
-    try:
-        # This will either load existing base_resume.txt or create it
-        resume_text = load_base_resume(job_dir)
-    except Exception as exc:
-        log(f"[SCRAPER] Could not load resume for AI inference: {exc}")
-        return {}
-
-    if not resume_text or len(resume_text.strip()) < 50:
-        # Too little signal for AI to do anything smart
-        return {}
-
-    # Prompt the model to return STRICT JSON
-    prompt = f"""
-You are an expert career coach.
-
-You will read a candidate's resume and infer a target job title and skill list
-to drive a job search. Return ONLY valid JSON with this exact schema:
-
-{{
-  "job_title": string or null,
-  "title_confidence": float,  // 0.0 to 1.0
-  "skills": [string, ...]
-}}
-
-Rules:
-- "job_title" should be a generic professional title, e.g.:
-  "IT Support Specialist", "Desktop Support Technician",
-  "Project Manager", "Software Engineer", etc.
-- If the resume DOES clearly indicate a main professional identity
-  (e.g. header line or consistent role across experience),
-  set "job_title" to that and use title_confidence >= 0.7.
-- If the resume does NOT clearly indicate a main job title,
-  set "job_title" to null and title_confidence <= 0.5.
-- "skills" should be a deduplicated list of 8–25 job-relevant skills
-  and technologies from the resume.
-- Do NOT include commentary or backticks. Output JSON ONLY.
-
-Resume:
-\"\"\"{resume_text}\"
-\"\"\""""
-
-    try:
-        raw = run_ai(prompt)
-    except Exception as exc:
-        log(f"[SCRAPER] AI meta inference failed: {exc}")
-        return {}
-
-    try:
-        data = json.loads(raw)
-    except Exception as exc:
-        log(f"[SCRAPER] Failed to parse AI meta JSON: {exc}; raw={raw[:200]!r}")
-        return {}
-
-    job_title = data.get("job_title")
-    try:
-        title_conf = float(data.get("title_confidence") or 0.0)
-    except (TypeError, ValueError):
-        title_conf = 0.0
-
-    skills_raw = data.get("skills") or []
-    if not isinstance(skills_raw, list):
-        skills_raw = []
-
-    # Clean and dedupe skills
-    norm_skills: List[str] = []
-    seen = set()
-    for s in skills_raw:
-        if not isinstance(s, str):
-            continue
-        s_clean = s.strip()
-        if not s_clean:
-            continue
-        key = s_clean.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        norm_skills.append(s_clean)
-
-    inferred: Dict[str, Any] = {}
-
-    # Only accept title if AI is reasonably confident
-    if isinstance(job_title, str) and job_title.strip() and title_conf >= 0.7:
-        inferred["target_roles"] = [job_title.strip()]
-
-    if norm_skills:
-        inferred["skills"] = norm_skills
-
-    log(f"[SCRAPER] AI-inferred meta from resume: {inferred} (conf={title_conf:.2f})")
-
-    # Optional: write this out for debugging / transparency
-    try:
-        ai_meta_path = job_dir / "resume_ai_meta.json"
-        with ai_meta_path.open("w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "job_title": job_title,
-                    "title_confidence": title_conf,
-                    "skills": norm_skills,
-                },
-                f,
-                indent=2,
-            )
-    except Exception as exc:
-        log(f"[SCRAPER] WARNING: could not write resume_ai_meta.json: {exc}")
-
-    return inferred
-
-def load_client_meta(job_dir: Path) -> Dict[str, Any]:
-    """
-    Load client_request.json from job_dir, then (IF NEEDED) enrich it
-    with AI-inferred title/skills from the resume.
-
-    Priority:
-      1) Fiverr intake (client_request.json) — we never override an explicit title.
-      2) AI inference from resume, only if no title is present.
-      3) If AI can't find a clear title, we still use AI skills, and
-         the search will be skills-driven.
-    """
-    meta_path = job_dir / "client_request.json"
-    meta: Dict[str, Any] = {}
-
-    # 1) Base: Fiverr intake if present
-    if meta_path.exists():
-        try:
-            with meta_path.open("r", encoding="utf-8") as f:
-                meta = json.load(f) or {}
-        except Exception as e:
-            log(f"WARNING: Failed to parse {meta_path}: {e}")
-            meta = {}
-    else:
-        log(f"WARNING: {meta_path} not found; will infer metadata from resume if possible.")
-
-    # Flatten one common pattern: some pipelines put data under meta{}
-    if isinstance(meta.get("meta"), dict):
-        base_meta = meta["meta"]
-    else:
-        base_meta = meta
-
-    # 2) Check what we already have
-    has_title = any(
-        bool(base_meta.get(k))
-        for k in ("target_roles", "preferred_titles", "target_title", "headline", "job_title")
-    )
-    has_skills = any(bool(base_meta.get(k)) for k in ("skills", "key_skills"))
-
-    # 3) If we're missing either title or skills, ask AI to read the resume
-    if (not has_title) or (not has_skills):
-        inferred = infer_meta_from_resume_ai(job_dir)
-
-        # Title: ONLY if there was no title from Fiverr AND AI is confident
-        if not has_title and inferred.get("target_roles"):
-            base_meta.setdefault("target_roles", inferred["target_roles"])
-
-        # Skills: if user didn't already give skills, fill from AI
-        if not has_skills and inferred.get("skills"):
-            if not base_meta.get("skills") and not base_meta.get("key_skills"):
-                base_meta["skills"] = inferred["skills"]
-
-    return base_meta
-
-def infer_meta_from_resume(job_dir: Path) -> Dict[str, Any]:
-    """
-    Fallback: infer a rough target title and skills from the resume text
-    when client_request.json is missing or incomplete.
-    """
-    try:
-        text = load_base_resume(job_dir)
-    except Exception as exc:
-        log(f"[SCRAPER] Could not load resume for inference: {exc}")
-        return {}
-
-    if not text:
-        return {}
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    # --- infer title from the first few non-contact lines
+    # --- infer title: look at the top 30 non-contact lines
     title_candidate = ""
-    section_stop = {
-        "summary", "professional summary", "experience", "work experience",
-        "employment history", "education", "projects", "skills", "technical skills",
-        "certifications", "profile", "objective",
-    }
-
     for ln in lines[:30]:
         low = ln.lower()
-        if "@" in low or "linkedin.com" in low or "github.com" in low:
-            continue
-        if any(stop in low for stop in section_stop):
+        if "@" in low or "www." in low or "linkedin.com" in low:
             continue
         if len(ln) < 5 or len(ln) > 80:
             continue
+        if "objective" in low or "summary" in low:
+            continue
+        # require at least two words
+        if " " not in ln:
+            continue
+        words = ln.split()
+        cap_ratio = sum(1 for w in words if w[:1].isupper()) / len(words)
+        if cap_ratio < 0.5:
+            continue
         if not any(ch.isalpha() for ch in ln):
             continue
-
-        words = ln.split()
-        if len(words) > 10:
-            continue
-        cap_words = sum(1 for w in words if w[0].isupper())
-        if not (ln.isupper() or cap_words / len(words) >= 0.4):
-            continue
-
         title_candidate = ln
         break
 
-    # --- infer skills from a Skills section
+    # --- infer skills: look for a Skills section and harvest bullet/CSV lines
     skills: List[str] = []
-    for idx, ln in enumerate(lines):
+    for i, ln in enumerate(lines):
         low = ln.lower()
         if "skill" in low:
-            for j in range(idx + 1, min(idx + 8, len(lines))):
+            for j in range(i + 1, min(i + 8, len(lines))):
                 seg = lines[j].strip()
                 if not seg:
                     continue
-                seg_low = seg.lower()
-                if any(stop in seg_low for stop in section_stop):
-                    break
-                parts = re.split(r"[•\u2022,;\-|·]", seg)
+                parts = re.split(r"[•\u2022\-–,;]", seg)
                 for p in parts:
-                    p = p.strip(" •\u2022-–·")
+                    p = p.strip(" •\u2022-–")
                     if len(p) >= 2:
                         skills.append(p)
             break
 
-    # de-dupe skills, case-insensitive
+    # dedupe / normalize skills a bit
     seen = set()
     norm_skills: List[str] = []
     for s in skills:
-        key = s.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        norm_skills.append(s)
-        if len(norm_skills) >= 20:
+        low = s.lower()
+        if low not in seen:
+            seen.add(low)
+            norm_skills.append(s)
+        if len(norm_skills) >= 12:
             break
 
     inferred: Dict[str, Any] = {}
@@ -505,6 +125,50 @@ def infer_meta_from_resume(job_dir: Path) -> Dict[str, Any]:
 
     log(f"[SCRAPER] Inferred from resume: {inferred}")
     return inferred
+# -----------------------------
+# Utility functions
+# -----------------------------
+
+def log(msg: str) -> None:
+    print(f"[SCRAPER] {msg}", flush=True)
+
+def load_client_meta(job_dir: Path) -> Dict[str, Any]:
+    """
+    Load client_request.json from job_dir, then fill in any missing
+    title/skills by inferring them from the resume text.
+    """
+    meta_path = job_dir / "client_request.json"
+    meta: Dict[str, Any] = {}
+
+    if meta_path.exists():
+        try:
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception as e:
+            log(f"WARNING: Failed to parse {meta_path}: {e}")
+            meta = {}
+    else:
+        log(f"WARNING: {meta_path} not found; will infer metadata from resume if possible.")
+
+    # Decide what we still need
+    has_title = any(
+        bool(meta.get(k))
+        for k in ("target_roles", "preferred_titles", "target_title", "headline", "job_title")
+    )
+    has_skills = any(bool(meta.get(k)) for k in ("skills", "key_skills"))
+
+    if not has_title or not has_skills:
+        inferred = infer_meta_from_resume(job_dir)
+
+        if not has_title and inferred.get("target_roles"):
+            meta.setdefault("target_roles", inferred["target_roles"])
+
+        if not has_skills and inferred.get("skills"):
+            # prefer skills, but don’t overwrite if user already set key_skills
+            if not meta.get("skills") and not meta.get("key_skills"):
+                meta["skills"] = inferred["skills"]
+
+    return meta
 
 
 def normalize_skills(meta: Dict[str, Any]) -> List[str]:
@@ -527,55 +191,62 @@ def normalize_skills(meta: Dict[str, Any]) -> List[str]:
 
     return [s.lower() for s in skills]
 
+
 def extract_title_and_location(meta: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Decide on search title and location based on metadata from client_request
-    and/or inferred resume meta.
+    Determine search title and location from metadata.
+
+    Title priority:
+      1. target_roles[0]
+      2. preferred_titles[0]
+      3. target_title / headline / job_title
+
+    Location priority:
+      - If remote_preference == "remote_only" -> "Remote"
+      - If remote_preference == "remote_plus_local" -> zip if present, else "Remote"
+      - Else: zip if present, else `location`, else "Remote"
     """
-    # Title selection
-    title = (
-        meta.get("search_title")
-        or meta.get("target_title")
-        or meta.get("role")
-        or ""
-    )
-    if not title:
-        guessed_roles = meta.get("target_roles") or []
-        if guessed_roles:
-            title = guessed_roles[0]
-        else:
-            # Absolute last-ditch; better than crashing
-            title = "Desktop Support Technician"
+    target_roles = meta.get("target_roles") or []
+    preferred_titles = meta.get("preferred_titles") or []
 
-    # Location hints from intake / inferred meta
-    location_fallback = (
-        meta.get("location")
-        or meta.get("city_state")
-        or meta.get("city")
-        or meta.get("region")
-        or ""
-    )
-    zip_code = (meta.get("zip") or meta.get("postal_code") or "").strip()
-    remote_pref = (meta.get("remote_preference") or "local_only").strip().lower()
+    # Normalize lists
+    if isinstance(target_roles, str):
+        target_roles = [s.strip() for s in target_roles.split(",") if s.strip()]
+    if isinstance(preferred_titles, str):
+        preferred_titles = [s.strip() for s in preferred_titles.split(",") if s.strip()]
 
-    # If they explicitly want remote only, don't force any geo constraint
-    if remote_pref == "remote_only":
-        return title, "Remote"
-
-    # Mixed or local-only: prefer concrete geo first
-    if zip_code:
-        # Most precise: zip-based search
-        location = zip_code
-    elif location_fallback and location_fallback.strip().lower() not in {
-        "united states",
-        "usa",
-        "us",
-    }:
-        # Use a specific city/state fallback, but never the whole US as a "location"
-        location = location_fallback.strip()
+    title = ""
+    if isinstance(target_roles, list) and target_roles:
+        title = target_roles[0]
+    elif isinstance(preferred_titles, list) and preferred_titles:
+        title = preferred_titles[0]
     else:
-        # No good local signal; treat as effectively remote-focused
+        title = (
+            meta.get("target_title")
+            or meta.get("headline")
+            or meta.get("job_title")
+            or ""
+        )
+
+    title = str(title).strip()
+
+    remote_pref = str(meta.get("remote_preference") or "").lower()
+    zip_code = str(meta.get("location_zip") or "").strip()
+    location_fallback = str(meta.get("location") or "").strip()
+
+    if remote_pref == "remote_only":
         location = "Remote"
+    elif remote_pref == "remote_plus_local":
+        # Prefer local zip, but remote is acceptable
+        location = zip_code or "Remote"
+    else:
+        # Local-only or unspecified
+        if zip_code:
+            location = zip_code
+        elif location_fallback:
+            location = location_fallback
+        else:
+            location = "Remote"
 
     return title, location
 
@@ -897,11 +568,6 @@ def scrape_linkedin(browser, query: str, location: str, skills: List[str], title
                     href = link_el.get_attribute("href") or ""
                 if href and href.startswith("/"):
                     href = f"https://www.linkedin.com{href}"
-
-                # Prefer core LinkedIn domain; skip localized subdomains (uk.linkedin.com, in.linkedin.com, etc.)
-                if href and "linkedin.com" in href:
-                    if "://www.linkedin.com" not in href and "://linkedin.com" not in href:
-                        continue
 
                 text_for_score = f"{title}\n{company}\n{loc_text}\n{snippet}"
                 score = compute_score(text_for_score, skills, title_hint=title_hint)
