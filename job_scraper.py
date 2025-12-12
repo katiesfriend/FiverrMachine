@@ -31,9 +31,10 @@ import json
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, urlunparse
 import re
 from resume_loader import load_base_resume
 from engines.ai_model import run_ai
@@ -254,6 +255,19 @@ def debug(msg: str) -> None:
     if DEBUG_SCRAPER:
         log(f"[SCRAPER-DEBUG] {msg}")
 
+
+@dataclass
+class JobPosting:
+    id: str
+    title: str
+    company: str
+    city: str
+    state: str
+    url: str
+    salary: str
+    board: str
+    raw_description_text: str
+
 def infer_meta_from_resume_ai(job_dir: Path) -> Dict[str, Any]:
     """
     Use an LLM to read base_resume.txt and infer:
@@ -369,6 +383,54 @@ Resume:
         log(f"[SCRAPER] WARNING: could not write resume_ai_meta.json: {exc}")
 
     return inferred
+
+
+def parse_city_state(location: str) -> Tuple[str, str]:
+    """Best-effort split of a location string into city/state.
+
+    If parsing is uncertain, returns empty strings without raising.
+    """
+    if not location:
+        return "", ""
+
+    parts = [p.strip() for p in re.split(r",|\n", location) if p.strip()]
+    if len(parts) >= 2:
+        return parts[0], parts[1][:2].upper() if len(parts[1]) <= 3 else parts[1]
+
+    return "", ""
+
+
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url.strip())
+        cleaned = parsed._replace(fragment="", query="")
+        normalized = urlunparse(cleaned).rstrip("/")
+        return normalized.lower()
+    except Exception:
+        return url.strip().lower()
+
+
+def dedupe_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for job in jobs:
+        url_key = normalize_url(job.get("url", ""))
+        if url_key:
+            key = ("url", url_key)
+        else:
+            key = (
+                "meta",
+                (job.get("title") or "").lower().strip(),
+                (job.get("company") or "").lower().strip(),
+                (job.get("location") or "").lower().strip(),
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(job)
+    return deduped
 
 def load_client_meta(job_dir: Path) -> Dict[str, Any]:
     """
@@ -663,6 +725,64 @@ def clean_text(s: str) -> str:
     if not s:
         return ""
     return " ".join(s.split())
+
+
+# -----------------------------
+# Board search wrappers (status-aware)
+# -----------------------------
+
+
+def _search_board(
+    board: str,
+    scraper_fn,
+    browser,
+    query: str,
+    location: str,
+    skills: List[str],
+    title_hint: str,
+):
+    try:
+        jobs = scraper_fn(browser, query, location, skills, title_hint)
+        status = {"state": "ok", "reason": ""}
+        if not jobs:
+            status = {"state": "no_results", "reason": "no jobs returned"}
+    except Exception as exc:
+        log(f"ERROR scraping {board}: {exc}")
+        jobs = []
+        status = {"state": "error_or_blocked", "reason": str(exc)}
+
+    suffix = f" ({status['state']}{': ' + status['reason'] if status['reason'] else ''})"
+    log(
+        f"{board.capitalize()} query='{query}' loc='{location}' -> "
+        f"{len(jobs)}{suffix if len(jobs)==0 or status['state']!='ok' else ''}"
+    )
+    return jobs, status
+
+
+def search_linkedin(browser, query: str, location: str, skills: List[str], title_hint: str):
+    return _search_board("linkedin", scrape_linkedin, browser, query, location, skills, title_hint)
+
+
+def search_indeed(browser, query: str, location: str, skills: List[str], title_hint: str):
+    return _search_board("indeed", scrape_indeed, browser, query, location, skills, title_hint)
+
+
+def search_ziprecruiter(
+    browser, query: str, location: str, skills: List[str], title_hint: str
+):
+    return _search_board(
+        "ziprecruiter",
+        scrape_ziprecruiter,
+        browser,
+        query,
+        location,
+        skills,
+        title_hint,
+    )
+
+
+def search_usajobs(browser, query: str, location: str, skills: List[str], title_hint: str):
+    return _search_board("usajobs", scrape_usajobs, browser, query, location, skills, title_hint)
 
 
 # -----------------------------
@@ -1100,7 +1220,9 @@ def fetch_full_descriptions(browser, jobs: List[Dict[str, Any]]) -> None:
     context.close()
 
 
-def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None:
+def write_outputs(
+    job_dir: Path, jobs: List[Dict[str, Any]], top_n: int, board_status: Dict[str, Dict[str, Any]] = None
+) -> None:
     """
     Write job_description_XX.txt, job_sources.txt, and a JSON manifest.
 
@@ -1163,18 +1285,35 @@ def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None
         except Exception as e:
             log(f"ERROR writing {fname}: {e}")
 
+        city, state = parse_city_state(job.get("location", ""))
+        posting = JobPosting(
+            id=job_id,
+            title=job.get("title", ""),
+            company=job.get("company", ""),
+            city=city,
+            state=state,
+            url=job.get("url", ""),
+            salary=salary,
+            board=job.get("site", ""),
+            raw_description_text=job.get("full_text", ""),
+        )
+
         manifest.append(
             {
-                "job_id": job_id,
+                "job_id": posting.id,
                 "index": i,
-                "title": job.get("title", ""),
-                "company": job.get("company", ""),
+                "title": posting.title,
+                "company": posting.company,
                 "location": job.get("location", ""),
+                "city": posting.city,
+                "state": posting.state,
                 "site": job.get("site", ""),
-                "url": job.get("url", ""),
-                "salary": salary,
+                "board": posting.board,
+                "url": posting.url,
+                "salary": posting.salary,
                 "raw_scraper_score": job.get("score", 0.0),
                 "snippet": job.get("snippet", ""),
+                "raw_description_text": posting.raw_description_text,
             }
         )
 
@@ -1185,10 +1324,24 @@ def write_outputs(job_dir: Path, jobs: List[Dict[str, Any]], top_n: int) -> None
             high_fit_count = len(
                 [j for j in selected if j.get("score", 0.0) >= PRIMARY_FIT_THRESHOLD]
             )
+            boards_summary = []
+            board_status = board_status or {}
+            for board, info in board_status.items():
+                st = info.get("status", {})
+                state = st.get("state", "")
+                reason = st.get("reason", "")
+                boards_summary.append(
+                    f"{board}={info.get('count', 0)} ({state}{': ' + reason if reason else ''})"
+                )
+
             f.write(
                 f"# Selected {len(selected)} jobs "
-                f"(high-fit >= {PRIMARY_FIT_THRESHOLD}: {high_fit_count})\n\n"
+                f"(high-fit >= {PRIMARY_FIT_THRESHOLD}: {high_fit_count})\n"
             )
+            if boards_summary:
+                f.write(f"# Boards: {'; '.join(boards_summary)}\n\n")
+            else:
+                f.write("\n")
             for i, job in enumerate(selected, start=1):
                 salary = job.get("salary") or job.get("compensation") or ""
                 salary_str = salary if salary else "(no salary listed)"
@@ -1246,17 +1399,18 @@ def scrape_job_boards(job_dir: Path) -> None:
 
     all_jobs: List[Dict[str, Any]] = []
     per_site_counts: Dict[str, int] = {}
+    board_status: Dict[str, Dict[str, Any]] = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
         try:
             engines: List[Tuple[str, Any]] = [
-                ("indeed", scrape_indeed),
-                ("linkedin", scrape_linkedin),
-                ("ziprecruiter", scrape_ziprecruiter),
+                ("indeed", search_indeed),
+                ("linkedin", search_linkedin),
+                ("ziprecruiter", search_ziprecruiter),
                 ("glassdoor", scrape_glassdoor),
-                ("usajobs", scrape_usajobs),
+                ("usajobs", search_usajobs),
                 ("monster", scrape_monster),
             ]
 
@@ -1268,8 +1422,20 @@ def scrape_job_boards(job_dir: Path) -> None:
                     )
                     break
 
-                jobs = func(browser, query, location, skills, title_hint=query)
+                jobs_result = func(browser, query, location, skills, title_hint=query)
+                if isinstance(jobs_result, tuple) and len(jobs_result) == 2:
+                    jobs, status = jobs_result
+                else:
+                    jobs = jobs_result  # backward compatibility
+                    status = {"state": "ok", "reason": ""}
+                    if not jobs:
+                        status = {"state": "no_results", "reason": "no jobs returned"}
+
                 per_site_counts[site_name] = len(jobs)
+                board_status[site_name] = {
+                    "count": len(jobs),
+                    "status": status,
+                }
 
                 if cfg.max_jobs_per_site > 0:
                     jobs = sorted(jobs, key=lambda j: j.get("score", 0.0), reverse=True)[
@@ -1280,6 +1446,13 @@ def scrape_job_boards(job_dir: Path) -> None:
                 log(
                     f"{site_name}: kept {len(jobs)} (raw {per_site_counts[site_name]}). "
                     f"Running total: {len(all_jobs)}"
+                )
+
+            before_dedupe = len(all_jobs)
+            all_jobs = dedupe_jobs(all_jobs)
+            if len(all_jobs) != before_dedupe:
+                log(
+                    f"Deduped jobs: {before_dedupe} -> {len(all_jobs)} based on URL/title/company/location"
                 )
 
             log(f"Total collected scored jobs across all boards: {len(all_jobs)}")
@@ -1307,7 +1480,7 @@ def scrape_job_boards(job_dir: Path) -> None:
             fetch_full_descriptions(browser, to_fetch)
 
             # Now write outputs for the top_n jobs based on updated list
-            write_outputs(job_dir, to_fetch, top_n)
+            write_outputs(job_dir, to_fetch, top_n, board_status=board_status)
 
         finally:
             browser.close()

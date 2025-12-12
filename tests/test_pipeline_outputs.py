@@ -75,7 +75,7 @@ def test_scraper_collects_multiple_sites(monkeypatch, tmp_path):
         monkeypatch.setattr(
             job_scraper,
             engine,
-            lambda *args, site=engine, **kwargs: [dict(fake_job, site=site)],
+            lambda *args, site=engine, **kwargs: [dict(fake_job, site=site, url=f"https://example.com/{site}")],
         )
 
     job_scraper.scrape_job_boards(tmp_path)
