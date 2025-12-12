@@ -24,3 +24,9 @@ playwright/.cache/
 .idea/
 *.swp
 *.swo
+
+# Local pipeline scratch
+pipeline_JOB_*_codex*.json
+
+# Local pipeline scratch
+pipeline_JOB_*_codex*.json
