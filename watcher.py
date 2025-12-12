@@ -21,22 +21,22 @@ from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-BASE = Path("/home/mykl/webui/filesystem/FiverrMachine")
+BASE = Path(__file__).resolve().parent
 INTAKE = BASE / "INTAKE"
 PROCESSING = BASE / "PROCESSING"
 LOGS = BASE / "LOGS"
 
-INTAKE.mkdir(parents=True, exist_ok=True)
-PROCESSING.mkdir(parents=True, exist_ok=True)
-LOGS.mkdir(parents=True, exist_ok=True)
-
+def ensure_dirs() -> None:
+    INTAKE.mkdir(parents=True, exist_ok=True)
+    PROCESSING.mkdir(parents=True, exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
 
 def log(msg: str) -> None:
     """Append a message to watcher.log and print to stdout."""
+    ensure_dirs()
     line = f"[WATCHER] {msg}\n"
     print(line, end="")
     (LOGS / "watcher.log").open("a", encoding="utf-8").write(line)
-
 
 class IntakeHandler(FileSystemEventHandler):
     """
@@ -96,4 +96,5 @@ def main():
 
 
 if __name__ == "__main__":
+    ensure_dirs()
     main()
