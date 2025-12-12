@@ -17,12 +17,12 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install deps
+      - name: Create venv + install deps + verify
         run: |
+          python -m venv venv
+          source venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements_freeze_2025-12-10.txt
-
-      - name: Verify
-        run: |
           chmod +x verify.sh
           ./verify.sh
+
