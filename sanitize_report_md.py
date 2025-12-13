@@ -11,7 +11,7 @@ def _strip_bold(line: str) -> str:
     line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
     line = re.sub(r"__(.+?)__", r"\1", line)
     line = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", line)
-    line = re.sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"\1", line)
+    line = re.sub(r"(^|[^\w])_(?!\s)([^_]+?)(?<!\s)_([^\w]|$)", r"\1\2\3", line)
     return line
 
 
