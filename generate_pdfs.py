@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import json
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -67,6 +69,46 @@ def render_text_file_to_pdf(txt_path, pdf_path, title=None):
     c.save()
 
 
+def _label_from_name(name: str):
+    match = re.search(r"(\d+)", name)
+    if not match:
+        return None
+    try:
+        return f"{int(match.group(1)):02d}"
+    except ValueError:
+        return None
+
+
+def _selected_labels_from_summary(job_folder_path: str):
+    summary_path = os.path.join(job_folder_path, "selection_summary.json")
+    if not os.path.isfile(summary_path):
+        return []
+
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    labels = []
+    for raw in data.get("selected_labels", []):
+        norm = _label_from_name(str(raw))
+        if norm:
+            labels.append(norm)
+
+    return sorted(set(labels))
+
+
+def _labels_from_job_descriptions(job_folder_path: str):
+    labels = []
+    for name in os.listdir(job_folder_path):
+        if name.startswith("job_description_") and name.endswith(".txt"):
+            norm = _label_from_name(name)
+            if norm:
+                labels.append(norm)
+    return sorted(set(labels))
+
+
 def generate_pdfs_for_job_folder(job_folder_path):
     """
     Finds resume_jobXX.txt and cover_letter_jobXX.txt in a job folder
@@ -85,6 +127,22 @@ def generate_pdfs_for_job_folder(job_folder_path):
     files = os.listdir(job_folder_path)
     resumes = sorted(f for f in files if f.startswith("resume_job") and f.endswith(".txt"))
     covers = sorted(f for f in files if f.startswith("cover_letter_job") and f.endswith(".txt"))
+
+    allowed_labels = _selected_labels_from_summary(job_folder_path)
+    if not allowed_labels:
+        allowed_labels = _labels_from_job_descriptions(job_folder_path)
+    if not allowed_labels:
+        detected = []
+        for name in resumes + covers:
+            norm = _label_from_name(name)
+            if norm:
+                detected.append(norm)
+        allowed_labels = sorted(set(detected))
+
+    if allowed_labels:
+        allowed_set = set(allowed_labels)
+        resumes = [f for f in resumes if _label_from_name(f) in allowed_set]
+        covers = [f for f in covers if _label_from_name(f) in allowed_set]
 
     if not resumes and not covers:
         print(f"[PDF] No resume/cover_letter text files found in {job_folder_path}")

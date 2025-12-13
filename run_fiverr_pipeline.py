@@ -96,16 +96,16 @@ def main():
         [str(VENV_PY), str(BASE / "cover_letter_latex.py"), str(processing_job_dir)]
     ))
 
-    # 5) Package deliverables (zip, scoring json, PDFs, etc.)
-    steps.append(run_step(
-        "deliverable_packager",
-        [str(VENV_PY), str(BASE / "deliverable_packager.py"), str(processing_job_dir)]
-    ))
-
-    # 6) Career Insights letter
+    # 5) Career Insights letter (runs before packaging so artifacts can be attached)
     steps.append(run_step(
         "career_insights",
         [str(VENV_PY), str(BASE / "career_insights.py"), str(processing_job_dir)]
+    ))
+
+    # 6) Package deliverables (zip, scoring json, PDFs, etc.)
+    steps.append(run_step(
+        "deliverable_packager",
+        [str(VENV_PY), str(BASE / "deliverable_packager.py"), str(processing_job_dir)]
     ))
 
     # (Optional, later) Upload to Google Drive, notify phone

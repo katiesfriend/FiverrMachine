@@ -973,6 +973,9 @@ def write_selection_summary(job_dir: Path, config: PipelineConfig = DEFAULT_CONF
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "focus_shortlist": [j.get("job_id") for j in focus_shortlist],
+        "selected_labels": [
+            f"{int(str(j.get('label') or '0')):02d}" for j in focus_shortlist if j.get("label")
+        ],
         "jobs": summary_jobs,
     }
 

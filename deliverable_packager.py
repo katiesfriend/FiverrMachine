@@ -34,7 +34,7 @@ import subprocess
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 BASE = Path(__file__).resolve().parent
 DELIVERABLES = BASE / "DELIVERABLES"
@@ -260,6 +260,35 @@ def select_labels(job_root: Path, scores: List[JobScore]) -> Tuple[List[str], di
     }
     return selected_labels, summary
 
+
+def _normalize_label(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    m = re.search(r"(\d+)$", str(raw))
+    if not m:
+        return None
+    return f"{int(m.group(1)):02d}"
+
+
+def load_selected_from_summary(job_root: Path) -> Tuple[List[str], Optional[dict]]:
+    summary_path = job_root / "selection_summary.json"
+    if not summary_path.exists():
+        return [], None
+
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[PACKAGER]   [WARN] Failed to read selection_summary.json: {exc}")
+        return [], None
+
+    labels: List[str] = []
+    for raw in data.get("selected_labels", []):
+        norm = _normalize_label(raw)
+        if norm:
+            labels.append(norm)
+
+    return labels, data
+
 def build_zip(job_root: Path, selected_labels: List[str], summary_path: Path) -> Path:
     """Create the final ZIP containing only the selected jobs plus global reports."""
     job_folder_name = job_root.name
@@ -314,13 +343,23 @@ def main() -> None:
 
     print(f"[PACKAGER] Building deliverables ZIP for {job_root}", flush=True)
 
-    # 1) Try JSON scores (future Qwen integration)
-    scores = load_job_scores_from_json(job_root)
+    # 1) Try to honor existing selection summary
+    preselected, existing_summary = load_selected_from_summary(job_root)
 
-    # 2) Selection logic (may compute heuristic scores instead)
-    selected_labels, summary = select_labels(job_root, scores)
+    if preselected:
+        selected_labels = sorted(set(preselected))
+        summary = existing_summary or {}
+        summary["mode"] = summary.get("mode", "selection_summary")
+        summary["selected_labels"] = selected_labels
+        print(f"[PACKAGER] Using selection_summary.json -> {selected_labels}")
+    else:
+        # 2) Try JSON scores (future Qwen integration)
+        scores = load_job_scores_from_json(job_root)
 
-    # 3) Persist summary for later debugging / client report
+        # 3) Selection logic (may compute heuristic scores instead)
+        selected_labels, summary = select_labels(job_root, scores)
+
+    # Persist summary for later debugging / client report
     summary_path = job_root / "selection_summary.json"
     try:
         with summary_path.open("w", encoding="utf-8") as f:
@@ -328,7 +367,7 @@ def main() -> None:
     except Exception as exc:
         print(f"[PACKAGER]   [WARN] Failed to write selection_summary.json: {exc}")
 
-    # 4) Build ZIP
+    # Build ZIP
     zip_path = build_zip(job_root, selected_labels, summary_path)
 
     print(f"[PACKAGER] Created zip at {zip_path}")
@@ -351,21 +390,33 @@ def main() -> None:
         report_pdf = insights_json.get("report_pdf")
         pie_chart = insights_json.get("pie_chart")
 
-        # Append report + chart into the ZIP if they exist
-        if report_pdf and os.path.isfile(report_pdf):
-            with zipfile.ZipFile(zip_path, "a") as zf:
+        json_path = job_root / "career_insights_summary.json"
+        try:
+            json_path.write_text(json.dumps(insights_json, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+        with zipfile.ZipFile(zip_path, "a") as zf:
+            if pie_chart and os.path.isfile(pie_chart):
+                zf.write(
+                    pie_chart,
+                    arcname="career_insights/career_insights_skills_pie.png",
+                )
+            # Append report + chart into the ZIP if they exist
+            if report_pdf and os.path.isfile(report_pdf):
                 zf.write(
                     report_pdf,
                     arcname="career_insights/career_insights_report.pdf",
                 )
-                if pie_chart and os.path.isfile(pie_chart):
-                    zf.write(
-                        pie_chart,
-                        arcname="career_insights/career_insights_skills_pie.png",
-                    )
-            print("[PACKAGER] Career insights report added to ZIP.")
+            if json_path.exists():
+                zf.write(
+                    json_path,
+                    arcname="career_insights/career_insights_summary.json",
+                )
+        if pie_chart and os.path.isfile(pie_chart):
+            print("[PACKAGER] Career insights artifacts added to ZIP.")
         else:
-            print("[PACKAGER] Career insights report not found; skipping ZIP attach.")
+            print("[PACKAGER] Career insights chart not found; skipping chart attach.")
     except Exception as e:
         print(f"[PACKAGER] Career insights generation failed: {e}")
 
