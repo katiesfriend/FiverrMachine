@@ -66,6 +66,12 @@ def main():
         [str(VENV_PY), str(BASE / "job_scraper.py"), str(processing_job_dir)]
     ))
 
+    # 1b) Cleanup stale artifacts so we don't rebuild/ship old jobXX files
+    steps.append(run_step(
+        "cleanup_job_artifacts",
+        [str(VENV_PY), str(BASE / "cleanup_job_artifacts.py"), str(processing_job_dir)]
+    ))
+
     # 2) Build resume + cover letters with your Qwen pipeline
     steps.append(run_step(
         "packet_builder_qwen",
@@ -76,6 +82,12 @@ def main():
     steps.append(run_step(
         "report_builder",
         [str(VENV_PY), str(BASE / "report_builder.py"), str(processing_job_dir)]
+    ))
+
+    # 3b) Sanitize markdown so LaTeX output doesn't show **bold** and list numbering is stable
+    steps.append(run_step(
+        "sanitize_report_md",
+        [str(VENV_PY), str(BASE / "sanitize_report_md.py"), str(processing_job_dir / "final_report.md")]
     ))
 
     # 4) Generate PDFs (resume + cover letters) inside the job folder
